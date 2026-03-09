@@ -55,7 +55,7 @@ CHAIN_ID = 137
 
 # ── Tuning ─────────────────────────────────────────────────────────────────
 ARB_MIN       = 0.02    # min profit to fire — 2% threshold
-ORDER_SIZE    = 10.0    # USDC per leg
+ORDER_SIZE    = 5.0    # USDC per leg
 FILL_TIMEOUT  = 30      # seconds before timeout handler
 POLL_INTERVAL = 0.5     # fill poll interval
 MAX_POSITIONS = 3       # max open arb positions
