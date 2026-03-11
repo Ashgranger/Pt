@@ -50,18 +50,20 @@ GAMMA_BASE          = "https://gamma-api.polymarket.com"
 CLOB_BASE           = "https://clob.polymarket.com"
 WS_URL              = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
-MIN_ARB_SPREAD      = 0.001    # 0.1¢ — flag anything above this
+MIN_ARB_SPREAD      = 0.016    # 1.6¢ minimum arb spread
+MIN_YES_ASK         = 0.02     # YES ask must be > 2¢ (above 2 ticks)
+MIN_NO_ASK          = 0.02     # NO  ask must be > 2¢ (above 2 ticks)
 SHOW_TOP_N          = 10       # print top-N spreads every stat interval
 MIN_VOLUME_24H      = 1.0      # require at least $1 traded in last 24h
-MIN_LIQUIDITY       = 0.0      # filter: min $ liquidity (0 = no filter)
+MIN_LIQUIDITY       = 0.0      # filter: min $ liquidity
 REQUIRE_ACCEPTING   = True     # only markets with acceptingOrders:true
 ACTIVE_ONLY         = True     # only markets with active=true from API
 
 MARKET_PAGE_SIZE    = 500      # Gamma API page size
 REFRESH_MARKETS_S   = 300      # re-crawl market list every 5 min
-WS_TOKENS_PER_CONN  = 500      # tokens per WS connection (safe limit)
+WS_TOKENS_PER_CONN  = 500      # tokens per WS connection
 WS_PING_S           = 9.0      # WS keepalive
-HTTP_POLL_S         = 2.0      # how often HTTP fallback polls each batch
+HTTP_POLL_S         = 2.0      # HTTP fallback poll interval
 HTTP_BATCH_SIZE     = 100      # tokens per /books batch
 STAT_INTERVAL_S     = 30.0     # stats print interval
 TOP_ARB_COUNT       = 15       # leaderboard size
@@ -680,16 +682,19 @@ def _print_stats(gstats: GlobalStats,
     print(f"  WS/HTTP ticks    : {_Y}{gstats.ws_ticks}/{gstats.http_ticks}{_Z} "
           f"({ws_pct}% WS)  Errors: {_R}{gstats.errors}{_Z}")
 
-    # Top current spreads (closest to arb, even if below threshold)
+    # Top current spreads
     if top_spreads:
         print(f"\n{_Y}  TOP {SHOW_TOP_N} SPREADS RIGHT NOW  "
-              f"(threshold={MIN_ARB_SPREAD:.4f}){_Z}")
-        print(f"  {'Spread':>8}  {'YES ask':>8}  {'NO ask':>8}  Question")
-        print(f"  {'─'*8}  {'─'*8}  {'─'*8}  {'─'*42}")
-        for spread, m in top_spreads:
-            tag = f" {_G}◄ ARB{_Z}" if spread >= MIN_ARB_SPREAD else ""
-            print(f"  {spread:>8.5f}  {m.yes_ask:>8.5f}  "
-                  f"{m.no_ask:>8.5f}  {m.question[:42]}{tag}")
+              f"(arb threshold={MIN_ARB_SPREAD:.4f}  "
+              f"YES/NO min={MIN_YES_ASK:.3f}){_Z}")
+        print(f"  {'Spread':>8}  {'YES':>8}  {'NO':>8}  Question")
+        print(f"  {'─'*8}  {'─'*8}  {'─'*8}  {'─'*44}")
+        for spread, m, ya, na in top_spreads:
+            if m is None:
+                continue
+            tag = f" {_G}{_B}◄ ARB{_Z}" if spread >= MIN_ARB_SPREAD else ""
+            print(f"  {spread:>8.5f}  {ya:>8.5f}  "
+                  f"{na:>8.5f}  {m.question[:44]}{tag}")
 
     # Live open arbs
     if open_arbs:
@@ -734,30 +739,41 @@ def _print_stats(gstats: GlobalStats,
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def detector(state: State, gstats: GlobalStats):
-    last_stat   = time.monotonic()
+    last_stat  = time.monotonic()
     last_seen: Dict[str, Tuple[float, float]] = {}   # cid → (yes_ask, no_ask)
+    # rolling top-spreads buffer rebuilt every stat interval
+    top_buf: Dict[str, Tuple[float, float, float]] = {}  # cid → (spread, ya, na)
 
     while True:
         now_m   = time.monotonic()
-        markets = state.markets          # reference, not copy — fast
-
-        # ── Collect top spreads + detect arbs ────────────────────────────
-        top_buf: list = []               # (spread, market) for display
+        markets = state.markets
 
         for cid, m in markets.items():
             if not m.ready():
                 continue
 
             ya, na = m.yes_ask, m.no_ask
+
+            # ── Price filter: YES and NO must both be above min tick ──────
+            if ya < MIN_YES_ASK or na < MIN_NO_ASK:
+                # if was arb before, close it
+                if cid in state.open_arbs:
+                    ev = state.open_arbs.pop(cid)
+                    ev.close()
+                    _print_arb_close(ev, gstats.total_events + 1)
+                    gstats.record(ev)
+                continue
+
             if last_seen.get(cid) == (ya, na):
-                continue                 # no change, skip
+                continue                 # no change since last tick
 
             last_seen[cid] = (ya, na)
-            spread  = 1.0 - ya - na
-            is_arb  = spread >= MIN_ARB_SPREAD
+            spread = 1.0 - ya - na
 
-            # Keep top-N spreads for display
-            top_buf.append((spread, m))
+            # track for top-spreads display (all markets with valid prices)
+            top_buf[cid] = (spread, ya, na)
+
+            is_arb = spread >= MIN_ARB_SPREAD
 
             if is_arb:
                 if cid in state.open_arbs:
@@ -773,7 +789,7 @@ async def detector(state: State, gstats: GlobalStats):
                     _print_arb_close(ev, gstats.total_events + 1)
                     gstats.record(ev)
 
-        # Close arbs for removed markets
+        # Close arbs for markets removed from state
         for cid in list(state.open_arbs):
             if cid not in markets:
                 ev = state.open_arbs.pop(cid)
@@ -782,11 +798,19 @@ async def detector(state: State, gstats: GlobalStats):
 
         # ── Stats print ──────────────────────────────────────────────────
         if now_m - last_stat >= STAT_INTERVAL_S:
-            top_spreads = sorted(top_buf, reverse=True)[:SHOW_TOP_N]
-            _print_stats(gstats, state.open_arbs, markets, top_spreads)
+            # sort by spread descending — key is float, no Market comparison
+            top_list = sorted(
+                ((s, markets.get(cid), ya, na)
+                 for cid, (s, ya, na) in top_buf.items()
+                 if markets.get(cid) is not None),
+                key=lambda x: x[0],
+                reverse=True
+            )[:SHOW_TOP_N]
+            _print_stats(gstats, state.open_arbs, markets, top_list)
             last_stat = now_m
 
-        await asyncio.sleep(0.001)
+        # Zero sleep = maximum throughput, still yields to event loop
+        await asyncio.sleep(0)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
