@@ -51,9 +51,10 @@ CLOB_BASE           = "https://clob.polymarket.com"
 WS_URL              = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
 MIN_ARB_SPREAD      = 0.001    # 0.1¢ — flag anything above this
-SHOW_TOP_N          = 5        # print top-N spreads every tick even if no arb
-MIN_VOLUME_24H      = 0.0      # filter: min $volume in last 24h (0 = no filter)
+SHOW_TOP_N          = 10       # print top-N spreads every stat interval
+MIN_VOLUME_24H      = 1.0      # require at least $1 traded in last 24h
 MIN_LIQUIDITY       = 0.0      # filter: min $ liquidity (0 = no filter)
+REQUIRE_ACCEPTING   = True     # only markets with acceptingOrders:true
 ACTIVE_ONLY         = True     # only markets with active=true from API
 
 MARKET_PAGE_SIZE    = 500      # Gamma API page size
@@ -220,38 +221,44 @@ _TO_FAST = aiohttp.ClientTimeout(total=4,  connect=2)
 
 def _parse_one(m_raw: dict) -> Optional[Market]:
     """Parse one market dict → Market or None if should be skipped."""
-    # Skip explicitly disabled order books
-    if m_raw.get("enableOrderBook") is False:
-        return None
-
     # Must have exactly 2 clob token IDs
     toks = m_raw.get("clobTokenIds") or []
     if isinstance(toks, str):
         try: toks = _loads(toks)
         except: return None
-    if len(toks) < 2:
+    if not isinstance(toks, list) or len(toks) < 2:
         return None
 
-    # Active filter
-    if ACTIVE_ONLY:
-        active = m_raw.get("active")
-        closed = m_raw.get("closed")
-        # skip if explicitly closed or explicitly not active
-        if closed is True: return None
-        if active is False: return None
+    # Skip explicitly disabled order books
+    if m_raw.get("enableOrderBook") is False:
+        return None
 
-    # Volume / liquidity filters
+    # active=true, closed=false
+    if ACTIVE_ONLY:
+        if m_raw.get("closed") is True:  return None
+        if m_raw.get("active") is False: return None
+
+    # Must be accepting orders RIGHT NOW (this is the key filter)
+    if REQUIRE_ACCEPTING:
+        if m_raw.get("acceptingOrders") is False:
+            return None
+
+    # Volume / liquidity — use whichever field is present
     try:
-        vol24  = float(m_raw.get("volume24hr") or m_raw.get("volumeNum") or 0)
-        liq    = float(m_raw.get("liquidity")  or m_raw.get("liquidityNum") or 0)
+        vol24 = float(m_raw.get("volume24hr") or
+                      m_raw.get("volume24hrClob") or
+                      m_raw.get("volumeNum") or 0)
+        liq   = float(m_raw.get("liquidity") or
+                      m_raw.get("liquidityClob") or
+                      m_raw.get("liquidityNum") or 0)
     except (ValueError, TypeError):
         vol24 = liq = 0.0
 
     if vol24 < MIN_VOLUME_24H: return None
     if liq   < MIN_LIQUIDITY:  return None
 
-    cid      = (m_raw.get("conditionId") or m_raw.get("condition_id")
-                or m_raw.get("id") or "")
+    cid = (m_raw.get("conditionId") or m_raw.get("condition_id")
+           or m_raw.get("id") or "")
     if not cid: return None
 
     question = (m_raw.get("question") or m_raw.get("title") or "")
@@ -468,41 +475,55 @@ async def _ws_connection(ws_id: int, tokens: List[str],
                         if raw == "PONG":
                             continue
                         try:
-                            ev = _loads(raw)
+                            parsed = _loads(raw)
                         except Exception:
                             continue
 
-                        etype = ev.get("event_type")
+                        # WS sometimes sends a JSON array (list of events)
+                        # normalise to a flat list of event dicts
+                        if isinstance(parsed, list):
+                            events = parsed
+                        elif isinstance(parsed, dict):
+                            events = [parsed]
+                        else:
+                            continue
 
-                        if etype == "best_bid_ask":
-                            ask_raw = ev.get("best_ask")
-                            if ask_raw is None: continue
-                            state.update_ask(
-                                ev.get("asset_id", ""), float(ask_raw))
-                            gstats.ws_ticks += 1
+                        for ev in events:
+                            if not isinstance(ev, dict):
+                                continue
 
-                        elif etype == "book":
-                            asks = ev.get("asks")
-                            if asks:
-                                state.update_ask(
-                                    ev.get("asset_id", ""),
-                                    float(asks[0]["price"]))
+                            etype = ev.get("event_type")
 
-                        elif etype == "price_change":
-                            for pc in ev.get("price_changes") or []:
-                                ask_raw = pc.get("best_ask")
+                            if etype == "best_bid_ask":
+                                ask_raw = ev.get("best_ask")
                                 if ask_raw is None: continue
                                 state.update_ask(
-                                    pc.get("asset_id", ""),
-                                    float(ask_raw))
-                            gstats.ws_ticks += 1
+                                    ev.get("asset_id", ""), float(ask_raw))
+                                gstats.ws_ticks += 1
 
-                        elif etype == "market_resolved":
-                            cid = state.tok_to_cid.get(
-                                ev.get("winning_asset_id", ""), "")
-                            if cid:
-                                async with state.lock:
-                                    state.remove_market(cid)
+                            elif etype == "book":
+                                asks = ev.get("asks")
+                                if asks:
+                                    state.update_ask(
+                                        ev.get("asset_id", ""),
+                                        float(asks[0]["price"]))
+
+                            elif etype == "price_change":
+                                for pc in ev.get("price_changes") or []:
+                                    if not isinstance(pc, dict): continue
+                                    ask_raw = pc.get("best_ask")
+                                    if ask_raw is None: continue
+                                    state.update_ask(
+                                        pc.get("asset_id", ""),
+                                        float(ask_raw))
+                                gstats.ws_ticks += 1
+
+                            elif etype == "market_resolved":
+                                cid = state.tok_to_cid.get(
+                                    ev.get("winning_asset_id", ""), "")
+                                if cid:
+                                    async with state.lock:
+                                        state.remove_market(cid)
 
                     gstats.ws_connections -= 1
 
