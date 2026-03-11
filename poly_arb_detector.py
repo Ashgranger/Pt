@@ -411,9 +411,8 @@ async def market_refresher(session: aiohttp.ClientSession,
     first = True
     while True:
         t0 = time.monotonic()
-        print(f"{_C}  ↻  Crawling markets "
-              f"(active={ACTIVE_ONLY}, "
-              f"vol≥{MIN_VOLUME_24H}, liq≥{MIN_LIQUIDITY})…{_Z}")
+        if first:
+            print(f"{_C}  ↻  Crawling markets…{_Z}")
 
         fresh = await crawl_all(session, gstats)
         elapsed = time.monotonic() - t0
@@ -432,7 +431,9 @@ async def market_refresher(session: aiohttp.ClientSession,
             gstats.markets_active = len(state.markets)
 
         print(f"{_G}  ✓  {len(fresh)} active markets  "
-              f"+{len(added)}  -{len(removed)}  ({elapsed:.1f}s){_Z}")
+              f"+{len(added)}  -{len(removed)}  ({elapsed:.1f}s){_Z}"
+              if added or removed or first else
+              f"{_C}  · {_ts()}  {len(fresh)} markets (no change){_Z}")
 
         if added or first:
             state.ws_dirty.set()
@@ -779,7 +780,7 @@ async def detector(state: State, gstats: GlobalStats):
                 ev.close()
                 gstats.record(ev)
 
-        # Stats — one compact line every interval
+        # Stats — only print when something interesting is happening
         if now_m - last_stat >= STAT_INTERVAL_S:
             top_list = sorted(
                 ((s, markets.get(cid), ya, na)
@@ -788,7 +789,22 @@ async def detector(state: State, gstats: GlobalStats):
                 key=lambda x: x[0],
                 reverse=True
             )[:SHOW_TOP_N]
-            _print_stats(gstats, state.open_arbs, markets, top_list)
+
+            # Only print stats if there are positive spreads or open arbs
+            has_positive = any(s > 0 for s, _, _, _ in top_list)
+            if has_positive or state.open_arbs or gstats.total_events > 0:
+                _print_stats(gstats, state.open_arbs, markets, top_list)
+            else:
+                # Silent heartbeat — one line only
+                total_ticks = gstats.ws_ticks + gstats.http_ticks
+                ready = sum(1 for m in markets.values() if m.ready())
+                print(f"{_C}· {_ts()}  "
+                      f"markets={gstats.markets_active} priced={ready}  "
+                      f"ticks={total_ticks}  "
+                      f"best_spread={top_list[0][0]:+.5f} (all negative — no arb){_Z}"
+                      if top_list else
+                      f"{_C}· {_ts()}  waiting for price data…{_Z}")
+
             last_stat = now_m
 
         await asyncio.sleep(0)
