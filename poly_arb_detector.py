@@ -221,66 +221,187 @@ class State:
 #  GAMMA API — CRAWL ALL ACTIVE MARKETS
 # ─────────────────────────────────────────────────────────────────────────────
 
-_TO_SLOW = aiohttp.ClientTimeout(total=10, connect=3)
+_TO_SLOW = aiohttp.ClientTimeout(total=15, connect=5)
 _TO_FAST = aiohttp.ClientTimeout(total=3,  connect=1)
 
-async def crawl_all_markets(session: aiohttp.ClientSession) -> List[Market]:
+def _parse_markets(data: list) -> List[Market]:
+    """Extract Market objects from a raw Gamma or CLOB markets list."""
+    out: List[Market] = []
+    for m_raw in data:
+        # enableOrderBook check — skip if explicitly False, allow missing/None
+        if m_raw.get("enableOrderBook") is False:
+            continue
+
+        # clobTokenIds is a JSON-encoded string OR a list depending on source
+        toks = m_raw.get("clobTokenIds") or []
+        if isinstance(toks, str):
+            try:
+                toks = _loads(toks)
+            except Exception:
+                continue
+        if len(toks) < 2:
+            continue
+
+        # conditionId field name varies by endpoint
+        cid = (m_raw.get("conditionId")
+               or m_raw.get("condition_id")
+               or m_raw.get("id", ""))
+        if not cid:
+            continue
+
+        question = m_raw.get("question") or m_raw.get("title", "")
+        slug     = m_raw.get("slug", "")
+        neg_risk = bool(m_raw.get("negRisk") or m_raw.get("neg_risk", False))
+
+        out.append(Market(
+            condition_id = cid,
+            question     = question,
+            slug         = slug,
+            yes_tok      = str(toks[0]),
+            no_tok       = str(toks[1]),
+            neg_risk     = neg_risk,
+        ))
+    return out
+
+
+async def _try_gamma_markets(session: aiohttp.ClientSession) -> List[Market]:
     """
-    Paginate gamma-api /markets to get every active binary market.
-    Returns list of Market objects.
+    Gamma API /markets — probe for working param combination.
+    Tries progressively simpler param sets until one works.
+    Paginates via offset until exhausted.
     """
+    # Param sets to try in order (422 = bad param, move to next)
+    param_sets = [
+        {"active": "true", "closed": "false", "limit": str(MARKET_PAGE_SIZE)},
+        {"limit": str(MARKET_PAGE_SIZE)},
+        {"limit": "100"},
+        {},
+    ]
+
+    working_params: Optional[dict] = None
+
+    # Probe which param set works
+    for params in param_sets:
+        url = f"{GAMMA_BASE}/markets"
+        try:
+            async with session.get(url, params=params,
+                                   timeout=_TO_SLOW) as r:
+                body = await r.read()
+                if r.status == 200:
+                    data = _loads(body)
+                    if isinstance(data, list):
+                        working_params = params
+                        print(f"{_G}  Gamma /markets params: {params}{_Z}")
+                        break
+                    elif isinstance(data, dict):
+                        # may have a 'data' key
+                        inner = data.get("data") or data.get("markets") or []
+                        if inner:
+                            working_params = params
+                            print(f"{_G}  Gamma /markets (dict) params: {params}{_Z}")
+                            break
+                else:
+                    err = body[:120].decode(errors="replace")
+                    print(f"{_Y}  Gamma params {params} → {r.status}: {err}{_Z}")
+        except Exception as e:
+            print(f"{_Y}  Gamma probe error: {e}{_Z}")
+
+    if working_params is None:
+        return []
+
+    # Full paginated crawl with working params
     markets: List[Market] = []
     offset = 0
 
     while True:
-        url = (f"{GAMMA_BASE}/markets"
-               f"?active=true&closed=false"
-               f"&limit={MARKET_PAGE_SIZE}&offset={offset}"
-               f"&order=volume_24hr&ascending=false")
+        p = dict(working_params)
+        p["offset"] = str(offset)
         try:
-            async with session.get(url, timeout=_TO_SLOW) as r:
+            async with session.get(f"{GAMMA_BASE}/markets",
+                                   params=p, timeout=_TO_SLOW) as r:
                 if r.status != 200:
-                    print(f"{_R}  Gamma API {r.status} at offset {offset}{_Z}")
                     break
-                data = _loads(await r.read())
+                raw  = _loads(await r.read())
+                data = raw if isinstance(raw, list) else (
+                    raw.get("data") or raw.get("markets") or [])
         except Exception as e:
-            print(f"{_R}  Gamma crawl error: {e}{_Z}")
+            print(f"{_R}  Gamma page error: {e}{_Z}")
             break
 
-        if not isinstance(data, list):
+        batch = _parse_markets(data)
+        markets.extend(batch)
+
+        page_size = int(working_params.get("limit", 100))
+        if len(data) < page_size:
             break
-
-        for m_raw in data:
-            # Only markets with an active order book
-            if not m_raw.get("enableOrderBook", False):
-                continue
-
-            toks = m_raw.get("clobTokenIds") or []
-            if len(toks) < 2:
-                continue
-
-            cid      = m_raw.get("conditionId") or m_raw.get("id", "")
-            question = m_raw.get("question", m_raw.get("title", ""))
-            slug     = m_raw.get("slug", "")
-            neg_risk = bool(m_raw.get("negRisk", False))
-
-            if not cid:
-                continue
-
-            markets.append(Market(
-                condition_id = cid,
-                question     = question,
-                slug         = slug,
-                yes_tok      = toks[0],
-                no_tok       = toks[1],
-                neg_risk     = neg_risk,
-            ))
-
-        if len(data) < MARKET_PAGE_SIZE:
-            break   # last page
-        offset += MARKET_PAGE_SIZE
+        offset += page_size
 
     return markets
+
+
+async def _try_clob_markets(session: aiohttp.ClientSession) -> List[Market]:
+    """
+    CLOB /markets — cursor-based pagination (next_cursor).
+    Used as fallback if Gamma API fails.
+    """
+    markets: List[Market] = []
+    cursor  = ""
+
+    # Probe bare endpoint first
+    try:
+        async with session.get(f"{CLOB_BASE}/markets",
+                               timeout=_TO_SLOW) as r:
+            if r.status not in (200, 422):
+                return []
+            if r.status == 422:
+                print(f"{_Y}  CLOB /markets also 422, trying with next_cursor{_Z}")
+    except Exception:
+        return []
+
+    while True:
+        params = {"next_cursor": cursor} if cursor else {}
+        try:
+            async with session.get(f"{CLOB_BASE}/markets",
+                                   params=params, timeout=_TO_SLOW) as r:
+                if r.status != 200:
+                    break
+                raw = _loads(await r.read())
+        except Exception as e:
+            print(f"{_R}  CLOB markets error: {e}{_Z}")
+            break
+
+        # CLOB returns {"limit":..., "count":..., "next_cursor":..., "data":[...]}
+        if isinstance(raw, dict):
+            data        = raw.get("data") or []
+            next_cursor = raw.get("next_cursor", "")
+        elif isinstance(raw, list):
+            data        = raw
+            next_cursor = ""
+        else:
+            break
+
+        markets.extend(_parse_markets(data))
+
+        if not next_cursor or next_cursor == cursor:
+            break
+        cursor = next_cursor
+
+    return markets
+
+
+async def crawl_all_markets(session: aiohttp.ClientSession) -> List[Market]:
+    """Try Gamma API first, fall back to CLOB /markets."""
+    markets = await _try_gamma_markets(session)
+
+    if not markets:
+        print(f"{_Y}  Gamma returned 0 markets → trying CLOB /markets…{_Z}")
+        markets = await _try_clob_markets(session)
+
+    # Deduplicate by condition_id
+    seen: dict = {}
+    for m in markets:
+        seen[m.condition_id] = m
+    return list(seen.values())
 
 
 # ─────────────────────────────────────────────────────────────────────────────
