@@ -20,6 +20,7 @@ from ledger import Ledger, Fill
 from engine import MarketMakingEngine, QuoteTarget
 from orders import OrderManager, Order
 from utils import BPS, BUY, SELL, ZERO, ONE, Fatal, fmt
+from cross_exchange import CrossExchangeSupervisor
 
 log = logging.getLogger("bot")
 
@@ -65,6 +66,7 @@ class MarketMaker:
         self._last_logged_realized: Decimal = ZERO
         self._tick_lock = asyncio.Lock()
         self._dirty_evt = asyncio.Event()
+        self.cross_feed = CrossExchangeSupervisor(cfg, self.on_external_venue_bbo)
 
     def _get_market(self) -> Market:
         if not self.md.info:
@@ -146,7 +148,8 @@ class MarketMaker:
 
     def on_external_venue_bbo(self, venue: str, bid: Decimal, ask: Decimal,
                               bid_sz: Decimal = Decimal("1"), ask_sz: Decimal = Decimal("1")) -> None:
-        self.md.update_cross_venue(venue, bid, ask, bid_sz, ask_sz, self.now())
+        now = self.now()
+        self.md.update_cross_venue(venue, bid, ask, bid_sz, ask_sz, now)
         self._dirty_evt.set()
 
     def _handle_trade(self, tr: dict, now: float) -> None:
@@ -438,10 +441,12 @@ class MarketMaker:
             if self.om.maybe_orders:
                 await self.om.cancel_all()
 
-            log.info("Subscribed to data feeds. Level 7 MM Engine active.")
+            await self.cross_feed.start()
+            log.info("Subscribed to Arcus + external public data feeds. Cross-exchange intelligence active=%s", self.cfg.enable_cross_exchange)
 
             while not self.stop_evt.is_set():
                 now = self.now()
+                self.md.cross.prune_stale(now, self.cfg.cross_max_age_s)
                 await self._heartbeat(now)
                 await self._reconcile(now)
                 self._status_log(now)
@@ -459,4 +464,5 @@ class MarketMaker:
                 self.ledger.learner.save()
                 log.info("Saved online learning state to %s", self.cfg.learning_state_path)
             await self.om.cancel_all()
+            await self.cross_feed.stop()
             reader_task.cancel()

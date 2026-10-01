@@ -1,0 +1,2 @@
+websockets>=12,<16
+python-dotenv>=1.0

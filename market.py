@@ -88,6 +88,11 @@ class CrossVenueTracker:
         while self._history and now - self._history[0][0] > 60.0:
             self._history.popleft()
 
+    def prune_stale(self, now: float, max_age_s: float) -> None:
+        stale = [name for name, state in self.venues.items() if now - state.ts > max_age_s]
+        for name in stale:
+            self.venues.pop(name, None)
+
     def cross_fair_value(self) -> Optional[Decimal]:
         if not self.venues:
             return None

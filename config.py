@@ -100,6 +100,14 @@ class Config:
     cross_dispersion_widen_mult: Decimal
     cross_velocity_threshold_bps: Decimal
     guarantee_spread_capture: bool
+    binance_enabled: bool
+    binance_symbol: str
+    binance_ws_url: str
+    bybit_enabled: bool
+    bybit_symbol: str
+    bybit_category: str
+    bybit_ws_url: str
+    cross_max_age_s: float
 
     # --- Inventory Risk Management & Taker Loss Cut ------------------------ #
     enable_smart_inventory_mgmt: bool
@@ -209,6 +217,14 @@ class Config:
             cross_dispersion_widen_mult=_d("CROSS_DISPERSION_WIDEN_MULT", "1.5"),
             cross_velocity_threshold_bps=_d("CROSS_VELOCITY_THRESHOLD_BPS", "1.5"),
             guarantee_spread_capture=_b("GUARANTEE_SPREAD_CAPTURE", "1"),
+            binance_enabled=_b("BINANCE_ENABLED", "1"),
+            binance_symbol=str(_e("BINANCE_SYMBOL", "BTCUSDT")).upper(),
+            binance_ws_url=str(_e("BINANCE_WS_URL", "wss://stream.binance.com:9443")),
+            bybit_enabled=_b("BYBIT_ENABLED", "1"),
+            bybit_symbol=str(_e("BYBIT_SYMBOL", "BTCUSDT")).upper(),
+            bybit_category=str(_e("BYBIT_CATEGORY", "linear")).lower(),
+            bybit_ws_url=str(_e("BYBIT_WS_URL", "wss://stream.bybit.com/v5/public/linear")),
+            cross_max_age_s=float(_e("CROSS_MAX_AGE_S", "2.0")),
             enable_smart_inventory_mgmt=_b("ENABLE_SMART_INVENTORY_MGMT", "1"),
             taker_fee_bps=_d("TAKER_FEE_BPS", "2.2"),
             emergency_taker_loss_bps=_d("EMERGENCY_TAKER_LOSS_BPS", "6.0"),
