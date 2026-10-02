@@ -34,6 +34,7 @@ class Order:
     is_taker: bool = False
     is_reduce_only: bool = False
     ev_bps: Decimal = Decimal(0)
+    quote_mid: Optional[Decimal] = None
 
 
 class OrderManager:
@@ -107,12 +108,17 @@ class OrderManager:
         self.reject_until[side] = now + min(0.25 * 2 ** (self._reject_n[side] - 1), 4.0)
 
     async def place(self, pair_index: int, side: str, px: Decimal, qty: Decimal, now: float,
-                    time_in_force: str = "ALO", reduce_only: bool = False) -> Optional[Order]:
+                    time_in_force: str = "ALO", reduce_only: bool = False,
+                    quote_mid: Optional[Decimal] = None) -> Optional[Order]:
         if now < self.paused_until or not self._budget(now):
             return None
         m = self.get_market()
         tick = m.tick_for(px) if hasattr(m, "tick_for") else m.tick
-        px = q_down(px, tick) if side == BUY else q_up(px, tick)
+        is_taker = (time_in_force == "IOC")
+        if is_taker:
+            px = q_up(px, tick) if side == BUY else q_down(px, tick)
+        else:
+            px = q_down(px, tick) if side == BUY else q_up(px, tick)
         qty = q_down(qty, m.step)
         if qty < m.min_size or (m.min_notional > 0 and px * qty < m.min_notional):
             return None
@@ -126,16 +132,18 @@ class OrderManager:
         if not self._ok(resp) or not res.get("orderId") or str(res.get("status")).upper() == "REJECTED":
             self._error(f"place L{pair_index} {side}", resp if not self._ok(resp) else
                         {"status": resp.get("status"), "error": res}, now)
-            self._backoff(side, now)
+            if not is_taker:
+                self._backoff(side, now)
             return None
         self._consec_errors = 0
         self.n_place += 1
         oid = str(res["orderId"])
         o = Order(oid, pair_index, side, px, qty, qty, good_til, now, now,
-                  is_taker=(time_in_force == "IOC"), is_reduce_only=reduce_only)
+                  is_taker=is_taker, is_reduce_only=reduce_only, quote_mid=quote_mid)
         self.orders[oid] = o
-        self.pair_slots[(pair_index, side)] = oid
-        log.info("PLACE L%d %s %s @ %s", pair_index, side, fmt(qty), fmt(px))
+        if not is_taker:
+            self.pair_slots[(pair_index, side)] = oid
+        log.info("PLACE L%d %s %s @ %s (taker=%s)", pair_index, side, fmt(qty), fmt(px), is_taker)
         early = self._unmatched.pop(oid, None)
         if early:
             self._apply(o, early[1], now)
@@ -226,21 +234,24 @@ class OrderManager:
         
         for t in targets:
             slot = (t.pair_index, t.side)
-            active_slots.add(slot)
             existing = self.get_order_by_slot(t.pair_index, t.side)
             
             if getattr(t, "is_taker", False):
                 if existing:
                     await self.cancel(existing, now)
+                    self.pair_slots.pop(slot, None)
                 await self.place(t.pair_index, t.side, t.price, t.qty, now,
-                                 time_in_force="IOC", reduce_only=True)
+                                 time_in_force="IOC", reduce_only=True,
+                                 quote_mid=getattr(t, "quote_mid", None))
                 continue
 
+            active_slots.add(slot)
             is_exit = bool(getattr(t, "is_exit_quote", False))
             if existing is None:
                 if now >= self.reject_until[t.side]:
                     o_new = await self.place(t.pair_index, t.side, t.price, t.qty, now,
-                                             time_in_force="ALO", reduce_only=is_exit)
+                                             time_in_force="ALO", reduce_only=is_exit,
+                                             quote_mid=getattr(t, "quote_mid", None))
                     if o_new:
                         o_new.ev_bps = getattr(t, "expected_value_bps", Decimal(0))
             else:
@@ -255,18 +266,24 @@ class OrderManager:
                     should_modify = True
                     urgent = True
 
-                if is_retreating and drift >= self.cfg.retreat_bps:
+                m = self.get_market()
+                tick_bps = (m.tick / existing.price) * Decimal("10000") if existing.price > 0 else Decimal("0.1")
+                eff_retreat = min(self.cfg.retreat_bps, tick_bps * Decimal("0.9"))
+                eff_requote = min(self.cfg.requote_bps, tick_bps * Decimal("0.9"))
+
+                if is_retreating and (drift >= eff_retreat or abs(t.price - existing.price) >= m.tick):
                     should_modify = True
                     urgent = True
-                elif is_advancing and drift >= self.cfg.requote_bps and (now - existing.last_action >= (getattr(self.cfg, "touch_min_requote_s", self.cfg.min_requote_s) if existing.pair_index == 0 else self.cfg.min_requote_s)):
+                elif is_advancing and (drift >= eff_requote or abs(t.price - existing.price) >= m.tick) and (now - existing.last_action >= (getattr(self.cfg, "touch_min_requote_s", self.cfg.min_requote_s) if existing.pair_index == 0 else self.cfg.min_requote_s)):
                     queue_reset_cost = getattr(self.cfg, "queue_reset_cost_bps", Decimal("0.20"))
                     ev_gain = getattr(t, "expected_value_bps", Decimal(0)) - getattr(existing, "ev_bps", Decimal(0))
-                    if ev_gain >= queue_reset_cost or drift >= (self.cfg.requote_bps * Decimal("1.5")):
+                    if ev_gain >= queue_reset_cost or drift >= (self.cfg.requote_bps * Decimal("1.5")) or abs(t.price - existing.price) >= m.tick:
                         should_modify = True
 
                 if should_modify:
                     if await self.modify(existing, t.price, now, urgent=urgent, reduce_only=is_exit):
                         existing.ev_bps = getattr(t, "expected_value_bps", Decimal(0))
+                        existing.quote_mid = getattr(t, "quote_mid", None)
 
         for slot, oid in list(self.pair_slots.items()):
             if slot not in active_slots:
@@ -322,11 +339,16 @@ class OrderManager:
             self.on_fill(o.side, fill_qty, px, o)
         if state == "OPEN" or status == "OPEN":
             self._reject_n[o.side] = 0
-        if filled:
+
+        # IOC terminal handling per Arcus documentation
+        is_ioc_done = o.is_taker and (state in ("PARTIALLY_FILLED", "FILLED", "CANCELED", "EXPIRED", "REJECTED") or
+                                     status in ("PARTIALLY_FILLED", "FILLED", "CANCELED", "MARGIN_CANCELED", "REJECTED") or
+                                     o.remaining == Decimal(0))
+        if filled or is_ioc_done:
             self._remove_order(o.order_id)
         elif state in ("CANCELED", "REJECTED") or status in ("CANCELED", "MARGIN_CANCELED", "REJECTED"):
             reason = c.get("rejectionReason") or c.get("cancelReason") or ""
-            if state == "REJECTED" or status == "REJECTED":
+            if (state == "REJECTED" or status == "REJECTED") and not o.is_taker:
                 self.n_reject += 1
                 self._backoff(o.side, now)
             log.info("ORDER L%d %s %s %s", o.pair_index, o.side, state or status, reason)

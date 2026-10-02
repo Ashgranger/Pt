@@ -162,14 +162,15 @@ class MarketMaker:
     def _on_fill(self, side: str, qty: Decimal, price: Decimal, o: Order) -> None:
         now = self.now()
         m = self.md.info
-        mid = self.md.mid or price
+        mid = getattr(o, "quote_mid", None) or self.md.mid or price
         min_notional = m.min_notional if m else Decimal("5")
         
         is_maker = not getattr(o, "is_taker", False)
         fill = self.ledger.on_fill(side, qty, price, mid, now, min_notional, is_maker=is_maker)
+        current_mid = self.md.mid or price
         log.info("FILL L%d %s %s @ %s | edge=%sbps pos=%s pnl=$%s",
                  o.pair_index, side, fmt(qty), fmt(price), fmt(fill.edge_bps),
-                 fmt(self.ledger.position), fmt(self.ledger.total_pnl(mid)))
+                 fmt(self.ledger.position), fmt(self.ledger.total_pnl(current_mid)))
 
         self._recent_fills.append((now, side))
         while self._recent_fills and now - self._recent_fills[0][0] > self.cfg.burst_window_s:

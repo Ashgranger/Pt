@@ -12,7 +12,10 @@ from utils import canonical, fmt, to_int
 class Signer:
     OP_PLACE, OP_CANCEL, OP_MODIFY = 1, 2, 3
     SIDE = {"BUY": 0, "SELL": 1}
-    TIF_IOC, TIF_GTC, TIF_ALO = 1, 2, 3
+    # Per Arcus documentation (docs.arcus.xyz/guides/websocket-trading):
+    # TIF mapping: GTT=0, FOK=1, IOC=2, ALO=3
+    TIF_GTT, TIF_FOK, TIF_IOC, TIF_ALO = 0, 1, 2, 3
+    TIF_GTC = TIF_GTT
 
     def __init__(self, key_hex: str, address: str, account_index: int):
         self.priv = ed25519.Ed25519PrivateKey.from_private_bytes(bytes.fromhex(key_hex))
@@ -43,12 +46,20 @@ class Signer:
     def place(self, m: Market, side: str, px: Decimal, qty: Decimal, good_til_us: int,
               time_in_force: str = "ALO", reduce_only: bool = False) -> dict:
         ts = self.next_ts()
-        tif_code = self.TIF_IOC if time_in_force == "IOC" else (self.TIF_GTC if time_in_force == "GTC" else self.TIF_ALO)
+        if time_in_force == "IOC":
+            tif_code = self.TIF_IOC
+        elif time_in_force == "FOK":
+            tif_code = self.TIF_FOK
+        elif time_in_force in ("GTT", "GTC"):
+            tif_code = self.TIF_GTT
+        else:
+            tif_code = self.TIF_ALO
+
         r_val = 1 if reduce_only else 0
-        order_type = "MARKET" if time_in_force == "MARKET" else "LIMIT"
+        order_type = "LIMIT"
         tick = m.tick_for(px) if hasattr(m, "tick_for") else m.tick
-        g_val = 0 if time_in_force == "IOC" else (good_til_us * 1000)
-        gtt_body = "0" if time_in_force == "IOC" else str(good_til_us)
+        g_val = good_til_us * 1000
+        gtt_body = str(good_til_us)
         msg = self._typed(self.OP_PLACE, ts, m.market_id, g=g_val,
                           p=to_int(px, tick), q=to_int(qty, m.step), r=r_val,
                           s=self.SIDE[side], t=tif_code)
