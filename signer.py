@@ -46,13 +46,16 @@ class Signer:
         tif_code = self.TIF_IOC if time_in_force == "IOC" else (self.TIF_GTC if time_in_force == "GTC" else self.TIF_ALO)
         r_val = 1 if reduce_only else 0
         order_type = "MARKET" if time_in_force == "MARKET" else "LIMIT"
-        msg = self._typed(self.OP_PLACE, ts, m.market_id, g=good_til_us * 1000,
-                          p=to_int(px, m.tick), q=to_int(qty, m.step), r=r_val,
+        tick = m.tick_for(px) if hasattr(m, "tick_for") else m.tick
+        g_val = 0 if time_in_force == "IOC" else (good_til_us * 1000)
+        gtt_body = "0" if time_in_force == "IOC" else str(good_til_us)
+        msg = self._typed(self.OP_PLACE, ts, m.market_id, g=g_val,
+                          p=to_int(px, tick), q=to_int(qty, m.step), r=r_val,
                           s=self.SIDE[side], t=tif_code)
         body = {"address": self.address, "accountIndex": self.ai, "marketId": m.market_id,
                 "orderSide": side, "orderType": order_type, "timeInForce": time_in_force,
-                "goodTilTime": str(good_til_us), "quantity": fmt(qty), "price": fmt(px),
-                "reduceOnly": reduce_only, "timestamp": ts}
+                "goodTilTime": gtt_body, "quantity": fmt(qty), "price": fmt(px),
+                "reduceOnly": bool(reduce_only), "timestamp": ts}
         return self._envelope("placeOrder", body, msg, ts)
 
     def cancel(self, m: Market, order_id: str) -> dict:
@@ -66,12 +69,13 @@ class Signer:
                good_til_us: int, reduce_only: bool = False) -> dict:
         ts = self.next_ts()
         r_val = 1 if reduce_only else 0
+        tick = m.tick_for(px) if hasattr(m, "tick_for") else m.tick
         msg = self._typed(self.OP_MODIFY, ts, m.market_id, g=good_til_us * 1000, id=order_id,
-                          p=to_int(px, m.tick), q=to_int(qty, m.step), r=r_val,
+                          p=to_int(px, tick), q=to_int(qty, m.step), r=r_val,
                           s=self.SIDE[side], t=self.TIF_ALO)
         body = {"address": self.address, "accountIndex": self.ai, "marketId": m.market_id,
                 "orderId": order_id, "side": side, "quantity": fmt(qty), "price": fmt(px),
-                "timeInForce": "ALO", "reduceOnly": reduce_only, "goodTilTime": str(good_til_us)}
+                "timeInForce": "ALO", "reduceOnly": bool(reduce_only), "goodTilTime": str(good_til_us)}
         return self._envelope("modifyOrder", body, msg, ts)
 
     def legacy(self, action: str, body: dict) -> dict:

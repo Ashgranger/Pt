@@ -27,6 +27,8 @@ class QuoteTarget:
 class MarketMakingEngine:
     def __init__(self, cfg: Config):
         self.cfg = cfg
+        self._chase_top_until: float = 0.0
+        self._chase_bottom_until: float = 0.0
 
     def compute_fair_value(self, md: MarketData, now: float, ledger: Optional[Ledger] = None) -> Decimal:
         base_mid = md.mid
@@ -252,7 +254,7 @@ class MarketMakingEngine:
                 base_edge_bps = base_edge_bps * (ONE + dispersion_widen / Decimal("10.0"))
 
         if self.cfg.guarantee_spread_capture:
-            min_capture_edge = (Decimal("2.0") * self.cfg.maker_fee_bps) + Decimal("0.5")
+            min_capture_edge = (Decimal("2.0") * self.cfg.maker_fee_bps) + getattr(self.cfg, "guarantee_spread_capture_bps", Decimal("0.5"))
             base_edge_bps = max(base_edge_bps, min_capture_edge)
 
         base_edge_bps = clamp(base_edge_bps, min_edge, max_edge)
@@ -286,17 +288,46 @@ class MarketMakingEngine:
         ))
         ret_5s = md.ret_bps(self.cfg.trend_window_s, now)
         trend_pull = l.trend_pull_bps if l else self.cfg.trend_pull_bps
-        chasing_top = (ret_5s > Decimal("0.8") and (is_toxic or flow_bias > Decimal("0.3")))
-        chasing_bottom = (ret_5s < Decimal("-0.8") and (is_toxic or flow_bias < Decimal("-0.3")))
+        chase_cooldown = getattr(self.cfg, "chase_cooldown_s", 3.0)
+
+        chase_top_trigger = (ret_5s > Decimal("0.8") and (is_toxic or flow_bias > Decimal("0.30")))
+        if chase_top_trigger:
+            self._chase_top_until = now + chase_cooldown
+        chasing_top = (now < getattr(self, "_chase_top_until", 0.0) or (ret_5s > Decimal("0.6") and flow_bias > Decimal("0.20")))
+
+        chase_bottom_trigger = (ret_5s < Decimal("-0.8") and (is_toxic or flow_bias < Decimal("-0.30")))
+        if chase_bottom_trigger:
+            self._chase_bottom_until = now + chase_cooldown
+        chasing_bottom = (now < getattr(self, "_chase_bottom_until", 0.0) or (ret_5s < Decimal("-0.6") and flow_bias < Decimal("-0.20")))
 
                 # Adverse flow detection for long (facing selling pressure) and short (facing buying pressure)
         has_adverse_selling = (tfi <= Decimal("-0.5") or (tfi <= Decimal("-0.2") and obi <= Decimal("-0.5")) or (obi <= Decimal("-0.7")) or (flow_bias <= Decimal("-0.4")))
         has_adverse_buying = (tfi >= Decimal("0.5") or (tfi >= Decimal("0.2") and obi >= Decimal("0.5")) or (obi >= Decimal("0.7")) or (flow_bias >= Decimal("0.4")))
+        severe_sell_pressure = (flow_bias < Decimal("-0.50") or (is_toxic and md.obi < Decimal("-0.55")) or (has_adverse_selling and ret_5s < Decimal("-0.5")))
+        severe_buy_pressure = (flow_bias > Decimal("0.50") or (is_toxic and md.obi > Decimal("0.55")) or (has_adverse_buying and ret_5s > Decimal("0.5")))
+
+        depth_widen_buy = ZERO
+        depth_widen_sell = ZERO
+        depth_cut_buy = ZERO
+        depth_cut_sell = ZERO
+        if getattr(self.cfg, "use_depth_imbalance", False):
+            levels = getattr(self.cfg, "imbalance_levels", 7)
+            depth_obi = md.multi_depth_obi(levels)
+            widen_bps = getattr(self.cfg, "imbalance_widen_bps", Decimal("4.0"))
+            size_cut = getattr(self.cfg, "imbalance_size_cut", Decimal("0.3"))
+            if depth_obi < Decimal("-0.20"):
+                depth_widen_buy = widen_bps * abs(depth_obi)
+                depth_cut_buy = size_cut * abs(depth_obi)
+            elif depth_obi > Decimal("0.20"):
+                depth_widen_sell = widen_bps * depth_obi
+                depth_cut_sell = size_cut * depth_obi
 
         total_levels = 1 + max(0, self.cfg.extra_levels)
 
         remaining_buy_usd = max(ZERO, self.cfg.max_position_usd - pos_usd)
         remaining_sell_usd = max(ZERO, self.cfg.max_position_usd + pos_usd)
+        l0_bid_px = None
+        l0_ask_px = None
 
         for k in range(total_levels):
             k_spacing = Decimal(str(k)) * spacing
@@ -306,6 +337,10 @@ class MarketMakingEngine:
             
             size_mult = Decimal(str(math.pow(float(size_mult_base), k)))
             level_usd = max(self.cfg.order_usd * size_mult, m.min_notional)
+            level_edge_buy = level_edge + depth_widen_buy
+            level_usd_buy = max(level_usd * (ONE - depth_cut_buy), m.min_notional)
+            level_edge_sell = level_edge + depth_widen_sell
+            level_usd_sell = max(level_usd * (ONE - depth_cut_sell), m.min_notional)
 
             # --- BUY SIDE --- #
             is_unwind_buy = (pos_usd < 0)
@@ -346,18 +381,31 @@ class MarketMakingEngine:
                     else:
                         min_profit_bps = max(self.cfg.exit_min_profit_bps, Decimal("1.0"))
                         hold_time = ledger.hold_s(now)
-                        if hold_time <= 5.0:
+                        max_hold = self.cfg.max_hold_s
+                        if hold_time <= 10.0:
                             dynamic_min_profit_bps = min_profit_bps
                         else:
-                            decay = max(Decimal("0.0"), Decimal("1.0") - Decimal(str((hold_time - 5.0) / 25.0)))
-                            dynamic_min_profit_bps = max(min_profit_bps * decay, Decimal("0.0"))
-                        if self.cfg.enable_smart_inventory_mgmt and (has_adverse_flow or pos_ratio >= Decimal("0.70") or is_stressed or hold_time > 20.0):
-                            # Aggressive maker scratch: join best bid (0 maker fee)
-                            cand_px = md.bid
-                            if self.cfg.penny and (md.ask - md.bid) > Decimal("2") * tick:
-                                cand_px = md.bid + tick
+                            decay_span = max(10.0, max_hold * 0.5)
+                            decay = max(Decimal("0.0"), Decimal("1.0") - Decimal(str((hold_time - 10.0) / decay_span)))
+                            dynamic_min_profit_bps = max(min_profit_bps * decay, Decimal("0.2"))
+
+                        min_profit_px = ledger.avg_cost * (ONE - dynamic_min_profit_bps / BPS) if (ledger.avg_cost and ledger.avg_cost > ZERO) else md.bid
+                        breakeven_px = ledger.avg_cost * (ONE - self.cfg.maker_fee_bps / BPS) if (ledger.avg_cost and ledger.avg_cost > ZERO) else md.bid
+
+                        scratch_hold_thresh = min(max_hold * 0.6, 60.0)
+                        is_scratch_time = (hold_time > scratch_hold_thresh)
+                        should_maker_scratch = self.cfg.enable_smart_inventory_mgmt and (has_adverse_flow or pos_ratio >= Decimal("0.70") or is_stressed or is_scratch_time)
+
+                        if should_maker_scratch:
+                            if severe_buy_pressure or is_stressed or pos_ratio >= Decimal("0.85"):
+                                cand_px = md.bid
+                                if self.cfg.penny and (md.ask - md.bid) > Decimal("2") * tick and (md.bid + tick) <= breakeven_px:
+                                    cand_px = md.bid + tick
+                            else:
+                                cand_px = min(md.bid, breakeven_px)
+                                if self.cfg.penny and (md.ask - md.bid) > Decimal("2") * tick and (md.bid + tick) <= breakeven_px:
+                                    cand_px = md.bid + tick
                         else:
-                            min_profit_px = ledger.avg_cost * (ONE - dynamic_min_profit_bps / BPS) if (ledger.avg_cost and ledger.avg_cost > ZERO) else md.bid
                             cand_px = min(md.bid, min_profit_px)
                             if self.cfg.penny and (md.ask - md.bid) > Decimal("2") * tick and (md.bid + tick) <= min_profit_px:
                                 cand_px = md.bid + tick
@@ -388,9 +436,13 @@ class MarketMakingEngine:
                         is_fragile = bool(fragility >= getattr(self.cfg, "fragility_threshold", Decimal("0.60")))
                         is_exh = md.is_exhaustion(BUY, now) if hasattr(md, "is_exhaustion") else False
 
-                        touch_px = (md.bid + tick) if (self.cfg.penny and (md.ask - md.bid) > Decimal("2") * tick and not is_toxic and flow_bias >= Decimal("-0.2")) else md.bid
-                        model_px = (res_price - bid_asym_shift) * (ONE - (level_edge + buy_tox_penalty) / BPS)
-                        model_px = q_down(min(model_px, md.ask - tick), tick)
+                        penny_active = self.cfg.penny and getattr(self.cfg, "aggressive_touch", True)
+                        touch_px = (md.bid + tick) if (penny_active and (md.ask - md.bid) > Decimal("2") * tick and not is_toxic and flow_bias >= Decimal("-0.2")) else md.bid
+                        if touch_px >= mid:
+                            touch_px = md.bid
+
+                        model_px = (res_price - bid_asym_shift) * (ONE - (level_edge_buy + buy_tox_penalty) / BPS)
+                        model_px = q_down(min(model_px, md.bid), tick)
 
                         cand_options = [touch_px, md.bid - tick, model_px]
                         best_cand_px = cand_options[0]
@@ -398,7 +450,9 @@ class MarketMakingEngine:
                         best_p_fill = 0.5
 
                         for c_px in set(cand_options):
-                            c_px = min(c_px, md.ask - tick)
+                            c_px = min(c_px, md.bid + (tick if penny_active else ZERO))
+                            if c_px >= mid:
+                                c_px = md.bid
                             c_px = q_down(c_px, tick)
                             if c_px <= ZERO:
                                 continue
@@ -424,11 +478,15 @@ class MarketMakingEngine:
                         cand_px = best_cand_px
                         p_fill = best_p_fill
                         ev_bps = best_ev
-                    else:
-                        if k == 0 and self.cfg.penny and (md.ask - md.bid) > Decimal("2") * tick and not is_toxic and flow_bias >= Decimal("-0.2"):
+                        l0_bid_px = cand_px
+                    elif k == 0:
+                        penny_active = self.cfg.penny and getattr(self.cfg, "aggressive_touch", True)
+                        if penny_active and (md.ask - md.bid) > Decimal("2") * tick and not is_toxic and flow_bias >= Decimal("-0.2"):
                             cand_px = md.bid + tick
+                            if cand_px >= mid:
+                                cand_px = md.bid
                         else:
-                            cand_px = (res_price - bid_asym_shift) * (ONE - (level_edge + buy_tox_penalty) / BPS)
+                            cand_px = min(md.bid, (res_price - bid_asym_shift) * (ONE - (level_edge_buy + buy_tox_penalty) / BPS))
                         cand_px = min(cand_px, md.ask - tick)
                         cand_px = q_down(cand_px, tick)
                         if md.ask and cand_px >= md.ask:
@@ -441,9 +499,30 @@ class MarketMakingEngine:
                         skew_rate = l.skew_bps if l else self.cfg.skew_bps
                         inv_cost_bps = max(ZERO, (pos_usd - target_inv_usd) / self.cfg.max_position_usd) * skew_rate
                         ev_bps = Decimal(str(p_fill)) * (capture_bps - adv_bps) - fee_bps - inv_cost_bps
+                        l0_bid_px = cand_px
+                    else:
+                        anchor = l0_bid_px if l0_bid_px is not None else md.bid
+                        spacing_px = max(tick * Decimal(str(k)), q_down(mid * k_spacing / BPS, tick))
+                        cand_px = q_down(anchor - spacing_px, tick)
+                        if cand_px >= md.ask:
+                            cand_px = md.ask - tick
+                        dist_bps = (md.ask - cand_px) / mid * BPS
+                        p_fill = self.queue_fill_probability(BUY, cand_px, md, now, self.cfg.queue_horizon_s, ledger=ledger)
+                        capture_bps = (fair_val - cand_px) / fair_val * BPS
+                        adv_bps = self.expected_adverse_move(BUY, md, ledger, now)
+                        fee_bps = self.cfg.maker_fee_bps
+                        skew_rate = l.skew_bps if l else self.cfg.skew_bps
+                        inv_cost_bps = max(ZERO, (pos_usd - target_inv_usd) / self.cfg.max_position_usd) * skew_rate
+                        pred_m = l.predict_markout(BUY, regime, k, self.cfg.queue_horizon_s) if (l and hasattr(l, "predict_markout")) else ZERO
+                        ev_bps = Decimal(str(p_fill)) * (capture_bps + pred_m - adv_bps) - fee_bps - inv_cost_bps
+
+                    if self.cfg.guarantee_spread_capture:
+                        min_cap_bps = getattr(self.cfg, "guarantee_spread_capture_bps", Decimal("0.5"))
+                        min_dist = max(tick, q_down(mid * min_cap_bps / BPS, tick))
+                        cand_px = min(cand_px, q_down(mid - min_dist, tick))
 
                     if cand_px > ZERO:
-                        qty = q_down(level_usd / cand_px, step)
+                        qty = q_down(level_usd_buy / cand_px, step)
                         if qty >= m.min_size:
                             min_ev = max(ZERO, min_ev_base - self.cfg.ev_hysteresis_bps) if (existing_slots and (k, BUY) in existing_slots) else min_ev_base
                             if (not self.cfg.enable_adaptive_ev) or (ev_bps >= min_ev):
@@ -493,18 +572,31 @@ class MarketMakingEngine:
                     else:
                         min_profit_bps = max(self.cfg.exit_min_profit_bps, Decimal("1.0"))
                         hold_time = ledger.hold_s(now)
-                        if hold_time <= 5.0:
+                        max_hold = self.cfg.max_hold_s
+                        if hold_time <= 10.0:
                             dynamic_min_profit_bps = min_profit_bps
                         else:
-                            decay = max(Decimal("0.0"), Decimal("1.0") - Decimal(str((hold_time - 5.0) / 25.0)))
-                            dynamic_min_profit_bps = max(min_profit_bps * decay, Decimal("0.0"))
-                        if self.cfg.enable_smart_inventory_mgmt and (has_adverse_flow or pos_ratio >= Decimal("0.70") or is_stressed or hold_time > 20.0):
-                            # Aggressive maker scratch: join best ask (0 maker fee)
-                            cand_px = md.ask
-                            if self.cfg.penny and (md.ask - md.bid) > Decimal("2") * tick:
-                                cand_px = md.ask - tick
+                            decay_span = max(10.0, max_hold * 0.5)
+                            decay = max(Decimal("0.0"), Decimal("1.0") - Decimal(str((hold_time - 10.0) / decay_span)))
+                            dynamic_min_profit_bps = max(min_profit_bps * decay, Decimal("0.2"))
+
+                        min_profit_px = ledger.avg_cost * (ONE + dynamic_min_profit_bps / BPS) if (ledger.avg_cost and ledger.avg_cost > ZERO) else md.ask
+                        breakeven_px = ledger.avg_cost * (ONE + self.cfg.maker_fee_bps / BPS) if (ledger.avg_cost and ledger.avg_cost > ZERO) else md.ask
+
+                        scratch_hold_thresh = min(max_hold * 0.6, 60.0)
+                        is_scratch_time = (hold_time > scratch_hold_thresh)
+                        should_maker_scratch = self.cfg.enable_smart_inventory_mgmt and (has_adverse_flow or pos_ratio >= Decimal("0.70") or is_stressed or is_scratch_time)
+
+                        if should_maker_scratch:
+                            if severe_sell_pressure or is_stressed or pos_ratio >= Decimal("0.85"):
+                                cand_px = md.ask
+                                if self.cfg.penny and (md.ask - md.bid) > Decimal("2") * tick and (md.ask - tick) >= breakeven_px:
+                                    cand_px = md.ask - tick
+                            else:
+                                cand_px = max(md.ask, breakeven_px)
+                                if self.cfg.penny and (md.ask - md.bid) > Decimal("2") * tick and (md.ask - tick) >= breakeven_px:
+                                    cand_px = md.ask - tick
                         else:
-                            min_profit_px = ledger.avg_cost * (ONE + dynamic_min_profit_bps / BPS) if (ledger.avg_cost and ledger.avg_cost > ZERO) else md.ask
                             cand_px = max(md.ask, min_profit_px)
                             if self.cfg.penny and (md.ask - md.bid) > Decimal("2") * tick and (md.ask - tick) >= min_profit_px:
                                 cand_px = md.ask - tick
@@ -535,9 +627,13 @@ class MarketMakingEngine:
                         is_fragile = bool(fragility >= getattr(self.cfg, "fragility_threshold", Decimal("0.60")))
                         is_exh = md.is_exhaustion(SELL, now) if hasattr(md, "is_exhaustion") else False
 
-                        touch_px = (md.ask - tick) if (self.cfg.penny and (md.ask - md.bid) > Decimal("2") * tick and not is_toxic and flow_bias <= Decimal("0.2")) else md.ask
-                        model_px = (res_price + ask_asym_shift) * (ONE + (level_edge + sell_tox_penalty) / BPS)
-                        model_px = q_up(max(model_px, md.bid + tick), tick)
+                        penny_active = self.cfg.penny and getattr(self.cfg, "aggressive_touch", True)
+                        touch_px = (md.ask - tick) if (penny_active and (md.ask - md.bid) > Decimal("2") * tick and not is_toxic and flow_bias <= Decimal("0.2")) else md.ask
+                        if touch_px <= mid:
+                            touch_px = md.ask
+
+                        model_px = (res_price + ask_asym_shift) * (ONE + (level_edge_sell + sell_tox_penalty) / BPS)
+                        model_px = q_up(max(model_px, md.ask), tick)
 
                         cand_options = [touch_px, md.ask + tick, model_px]
                         best_cand_px = cand_options[0]
@@ -545,7 +641,9 @@ class MarketMakingEngine:
                         best_p_fill = 0.5
 
                         for c_px in set(cand_options):
-                            c_px = max(c_px, md.bid + tick)
+                            c_px = max(c_px, md.ask - (tick if penny_active else ZERO))
+                            if c_px <= mid:
+                                c_px = md.ask
                             c_px = q_up(c_px, tick)
                             if c_px <= ZERO:
                                 continue
@@ -571,11 +669,15 @@ class MarketMakingEngine:
                         cand_px = best_cand_px
                         p_fill = best_p_fill
                         ev_bps = best_ev
-                    else:
-                        if k == 0 and self.cfg.penny and (md.ask - md.bid) > Decimal("2") * tick and not is_toxic and flow_bias <= Decimal("0.2"):
+                        l0_ask_px = cand_px
+                    elif k == 0:
+                        penny_active = self.cfg.penny and getattr(self.cfg, "aggressive_touch", True)
+                        if penny_active and (md.ask - md.bid) > Decimal("2") * tick and not is_toxic and flow_bias <= Decimal("0.2"):
                             cand_px = md.ask - tick
+                            if cand_px <= mid:
+                                cand_px = md.ask
                         else:
-                            cand_px = (res_price + ask_asym_shift) * (ONE + (level_edge + sell_tox_penalty) / BPS)
+                            cand_px = max(md.ask, (res_price + ask_asym_shift) * (ONE + (level_edge_sell + sell_tox_penalty) / BPS))
                         cand_px = max(cand_px, md.bid + tick)
                         cand_px = q_up(cand_px, tick)
                         if md.bid and cand_px <= md.bid:
@@ -588,9 +690,30 @@ class MarketMakingEngine:
                         skew_rate = l.skew_bps if l else self.cfg.skew_bps
                         inv_cost_bps = max(ZERO, -(pos_usd - target_inv_usd) / self.cfg.max_position_usd) * skew_rate
                         ev_bps = Decimal(str(p_fill)) * (capture_bps - adv_bps) - fee_bps - inv_cost_bps
+                        l0_ask_px = cand_px
+                    else:
+                        anchor = l0_ask_px if l0_ask_px is not None else md.ask
+                        spacing_px = max(tick * Decimal(str(k)), q_up(mid * k_spacing / BPS, tick))
+                        cand_px = q_up(anchor + spacing_px, tick)
+                        if cand_px <= md.bid:
+                            cand_px = md.bid + tick
+                        dist_bps = (cand_px - md.bid) / mid * BPS
+                        p_fill = self.queue_fill_probability(SELL, cand_px, md, now, self.cfg.queue_horizon_s, ledger=ledger)
+                        capture_bps = (cand_px - fair_val) / fair_val * BPS
+                        adv_bps = self.expected_adverse_move(SELL, md, ledger, now)
+                        fee_bps = self.cfg.maker_fee_bps
+                        skew_rate = l.skew_bps if l else self.cfg.skew_bps
+                        inv_cost_bps = max(ZERO, -(pos_usd - target_inv_usd) / self.cfg.max_position_usd) * skew_rate
+                        pred_m = l.predict_markout(SELL, regime, k, self.cfg.queue_horizon_s) if (l and hasattr(l, "predict_markout")) else ZERO
+                        ev_bps = Decimal(str(p_fill)) * (capture_bps + pred_m - adv_bps) - fee_bps - inv_cost_bps
+
+                    if self.cfg.guarantee_spread_capture:
+                        min_cap_bps = getattr(self.cfg, "guarantee_spread_capture_bps", Decimal("0.5"))
+                        min_dist = max(tick, q_up(mid * min_cap_bps / BPS, tick))
+                        cand_px = max(cand_px, q_up(mid + min_dist, tick))
 
                     if cand_px > ZERO:
-                        qty = q_down(level_usd / cand_px, step)
+                        qty = q_down(level_usd_sell / cand_px, step)
                         if qty >= m.min_size:
                             min_ev = max(ZERO, min_ev_base - self.cfg.ev_hysteresis_bps) if (existing_slots and (k, SELL) in existing_slots) else min_ev_base
                             if (not self.cfg.enable_adaptive_ev) or (ev_bps >= min_ev):

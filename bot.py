@@ -20,7 +20,6 @@ from ledger import Ledger, Fill
 from engine import MarketMakingEngine, QuoteTarget
 from orders import OrderManager, Order
 from utils import BPS, BUY, SELL, ZERO, ONE, Fatal, fmt
-from cross_exchange import CrossExchangeSupervisor
 
 log = logging.getLogger("bot")
 
@@ -66,7 +65,6 @@ class MarketMaker:
         self._last_logged_realized: Decimal = ZERO
         self._tick_lock = asyncio.Lock()
         self._dirty_evt = asyncio.Event()
-        self.cross_feed = CrossExchangeSupervisor(cfg, self.on_external_venue_bbo)
 
     def _get_market(self) -> Market:
         if not self.md.info:
@@ -148,8 +146,7 @@ class MarketMaker:
 
     def on_external_venue_bbo(self, venue: str, bid: Decimal, ask: Decimal,
                               bid_sz: Decimal = Decimal("1"), ask_sz: Decimal = Decimal("1")) -> None:
-        now = self.now()
-        self.md.update_cross_venue(venue, bid, ask, bid_sz, ask_sz, now)
+        self.md.update_cross_venue(venue, bid, ask, bid_sz, ask_sz, self.now())
         self._dirty_evt.set()
 
     def _handle_trade(self, tr: dict, now: float) -> None:
@@ -404,13 +401,13 @@ class MarketMaker:
             vol_str = f"${float(self.ledger.volume_usd):.2f}"
             fills_str = f"{self.ledger.n_fills} ({self.ledger.n_buys}B/{self.ledger.n_sells}S)"
 
-            log.info("LEARN [updates=%d tox=%d] | edge=%.2f-%.2fbps skew=%.2fbps spacing=%.2fbps mult=%.2f vol_k=%.2f tox_mult=%.2f min_ev=%.2fbps obi_a=%.2f tfi_b=%.2f kappa=%.2f | markout_1s=%s markout_5s=%s avg_markout=%s | win_rate=%s adverse_fill_rate=%s | realized_pnl_delta=%s inventory_pnl=%s | capture_spread=%s volume=%s fills=%s | reason=%s",
+            log.info("LEARN [updates=%d tox=%d] | edge=%.2f-%.2fbps skew=%.2fbps spacing=%.2fbps mult=%.2f vol_k=%.2f tox_mult=%.2f min_ev=%.2fbps obi_a=%.2f tfi_b=%.2f kappa=%.2f | markout_1s=%s markout_5s=%s avg_markout=%s | win_rate=%s adverse_fill_rate=%s | realized_pnl_delta=%s inventory_pnl=%s | capture_spread=%s volume=%s fills=%s",
                      s["total_updates"], s["toxic_fills"],
                      float(p["min_edge_bps"]), float(p["max_edge_bps"]), float(p["skew_bps"]),
                      float(p["level_spacing_bps"]), float(p["level_size_mult"]), float(p["vol_k"]),
                      float(p["tox_mult"]), float(p["min_ev_bps"]), float(p["obi_alpha"]),
                      float(p["tfi_beta"]), float(p["fill_prob_kappa"]),
-                     m1s, m5s, m_avg, wr, afr, pnl_delta, inv_pnl_str, cap_spr, vol_str, fills_str, reason)
+                     m1s, m5s, m_avg, wr, afr, pnl_delta, inv_pnl_str, cap_spr, vol_str, fills_str)
 
     async def run(self) -> None:
         log.info("Connecting to %s Arcus WS (%s)...", self.cfg.env_name, self.ex.ws_url)
@@ -423,46 +420,81 @@ class MarketMaker:
 
         try:
             import websockets
+            from websockets.exceptions import ConnectionClosed
         except ImportError:
-            log.error("websockets package not available; install via pip install websockets")
-            return
+            class ConnectionClosed(Exception):
+                pass
+            if not hasattr(self.ex, "ws") or self.ex.ws is None:
+                log.error("websockets package not available; install via pip install websockets")
+                return
 
-        async with websockets.connect(self.ex.ws_url, ping_interval=15, max_size=2**23) as ws:
-            self.ex.ws = ws
-            reader_task = asyncio.create_task(self.ex.reader())
+        reconnect_delay = 1.0
+        max_reconnect_delay = 15.0
 
-            await self.ex.subscribe("bbo", self.cfg.market)
-            await self.ex.subscribe("l2Orderbook", self.cfg.market)
-            await self.ex.subscribe("trades", self.cfg.market)
-            await self.ex.subscribe("orders", self.cfg.address)
-            await self.ex.subscribe("userFills", self.cfg.address)
-            await self.ex.subscribe("positions", self.cfg.address)
+        while not self.stop_evt.is_set():
+            reader_task = None
+            try:
+                log.info("Connecting to Arcus WebSocket (%s)...", self.ex.ws_url)
+                async with websockets.connect(
+                    self.ex.ws_url,
+                    ping_interval=15,
+                    ping_timeout=20,
+                    max_size=2**23,
+                    close_timeout=5
+                ) as ws:
+                    self.ex.ws = ws
+                    reader_task = asyncio.create_task(self.ex.reader())
 
-            if self.om.maybe_orders:
-                await self.om.cancel_all()
+                    await self.ex.subscribe("bbo", self.cfg.market)
+                    await self.ex.subscribe("l2Orderbook", self.cfg.market)
+                    await self.ex.subscribe("trades", self.cfg.market)
+                    await self.ex.subscribe("orders", self.cfg.address)
+                    await self.ex.subscribe("userFills", self.cfg.address)
+                    await self.ex.subscribe("positions", self.cfg.address)
 
-            await self.cross_feed.start()
-            log.info("Subscribed to Arcus + external public data feeds. Cross-exchange intelligence active=%s", self.cfg.enable_cross_exchange)
+                    reconnect_delay = 1.0
 
-            while not self.stop_evt.is_set():
-                now = self.now()
-                self.md.cross.prune_stale(now, self.cfg.cross_max_age_s)
-                await self._heartbeat(now)
-                await self._reconcile(now)
-                self._status_log(now)
+                    if self.om.maybe_orders:
+                        await self.om.cancel_all()
 
-                await self.tick()
+                    log.info("Subscribed to data feeds. Level 7 MM Engine active.")
 
-                try:
-                    await asyncio.wait_for(self._dirty_evt.wait(), timeout=self.cfg.loop_s)
-                    self._dirty_evt.clear()
-                except asyncio.TimeoutError:
-                    pass
+                    while not self.stop_evt.is_set() and self.ex.is_connected:
+                        now = self.now()
+                        await self._heartbeat(now)
+                        await self._reconcile(now)
+                        self._status_log(now)
 
-            log.info("Stopping bot - cancelling all resting orders...")
-            if self.cfg.enable_online_learning:
-                self.ledger.learner.save()
-                log.info("Saved online learning state to %s", self.cfg.learning_state_path)
+                        await self.tick()
+
+                        try:
+                            await asyncio.wait_for(self._dirty_evt.wait(), timeout=self.cfg.loop_s)
+                            self._dirty_evt.clear()
+                        except asyncio.TimeoutError:
+                            pass
+
+            except (ConnectionClosed, ConnectionResetError, BrokenPipeError, OSError) as e:
+                log.warning("WebSocket connection dropped (%s). Reconnecting in %.1fs...", e, reconnect_delay)
+            except Exception as e:
+                log.error("Error in bot run loop: %s", e, exc_info=True)
+            finally:
+                if reader_task and not reader_task.done():
+                    reader_task.cancel()
+                    try:
+                        await reader_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                self.ex.ws = None
+
+            if not self.stop_evt.is_set():
+                await asyncio.sleep(reconnect_delay)
+                reconnect_delay = min(reconnect_delay * 1.5, max_reconnect_delay)
+
+        log.info("Stopping bot - cancelling resting orders for market %s...", self.md.info.name if self.md.info else self.cfg.market)
+        if self.cfg.enable_online_learning:
+            self.ledger.learner.save()
+            log.info("Saved online learning state to %s", self.cfg.learning_state_path)
+        try:
             await self.om.cancel_all()
-            await self.cross_feed.stop()
-            reader_task.cancel()
+        except Exception:
+            pass

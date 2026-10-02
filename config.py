@@ -27,6 +27,22 @@ def _b(name: str, default: str) -> bool:
     return str(_e(name, default)).lower() in ("1", "true", "yes", "y", "on")
 
 
+
+def _parse_guarantee_spread_capture(name: str, default: str) -> tuple[bool, Decimal]:
+    v = _e(name, default)
+    s = str(v).strip().lower()
+    if s in ("0", "false", "no", "off"):
+        return False, Decimal("0")
+    try:
+        d = Decimal(str(v).strip())
+        if d > 0:
+            return True, d
+    except Exception:
+        pass
+    if s in ("1", "true", "yes", "on"):
+        return True, Decimal("0.5")
+    return False, Decimal("0")
+
 @dataclass
 class Config:
     # --- connection -------------------------------------------------------- #
@@ -100,14 +116,16 @@ class Config:
     cross_dispersion_widen_mult: Decimal
     cross_velocity_threshold_bps: Decimal
     guarantee_spread_capture: bool
-    binance_enabled: bool
-    binance_symbol: str
-    binance_ws_url: str
-    bybit_enabled: bool
-    bybit_symbol: str
-    bybit_category: str
-    bybit_ws_url: str
-    cross_max_age_s: float
+    guarantee_spread_capture_bps: Decimal
+    aggressive_touch: bool
+    touch_min_requote_s: float
+    use_depth_imbalance: bool
+    imbalance_levels: int
+    imbalance_widen_bps: Decimal
+    imbalance_size_cut: Decimal
+    continue_add_after_reduce: bool
+    run_tag: str
+    markout_horizons_s: str
 
     # --- Inventory Risk Management & Taker Loss Cut ------------------------ #
     enable_smart_inventory_mgmt: bool
@@ -164,6 +182,7 @@ class Config:
             raise Fatal("ARCUS_API_SIGNING_KEY must be the 64-hex Ed25519 private key")
         dry = _b("DRY_RUN", "1")
         market = str(_e("MARKET", "BTC-USD"))
+        guar_sc, guar_sc_bps = _parse_guarantee_spread_capture("GUARANTEE_SPREAD_CAPTURE", "1")
         cfg = cls(
             env_name=env_name, address=address, signing_key=key,
             account_index=int(_e("ARCUS_ACCOUNT_INDEX", 0)), market=market, dry_run=dry,
@@ -216,15 +235,17 @@ class Config:
             cross_lead_lag_weight=_d("CROSS_LEAD_LAG_WEIGHT", "0.5"),
             cross_dispersion_widen_mult=_d("CROSS_DISPERSION_WIDEN_MULT", "1.5"),
             cross_velocity_threshold_bps=_d("CROSS_VELOCITY_THRESHOLD_BPS", "1.5"),
-            guarantee_spread_capture=_b("GUARANTEE_SPREAD_CAPTURE", "1"),
-            binance_enabled=_b("BINANCE_ENABLED", "1"),
-            binance_symbol=str(_e("BINANCE_SYMBOL", "BTCUSDT")).upper(),
-            binance_ws_url=str(_e("BINANCE_WS_URL", "wss://stream.binance.com:9443")),
-            bybit_enabled=_b("BYBIT_ENABLED", "1"),
-            bybit_symbol=str(_e("BYBIT_SYMBOL", "BTCUSDT")).upper(),
-            bybit_category=str(_e("BYBIT_CATEGORY", "linear")).lower(),
-            bybit_ws_url=str(_e("BYBIT_WS_URL", "wss://stream.bybit.com/v5/public/linear")),
-            cross_max_age_s=float(_e("CROSS_MAX_AGE_S", "2.0")),
+            guarantee_spread_capture=guar_sc,
+            guarantee_spread_capture_bps=guar_sc_bps,
+            aggressive_touch=_b("AGGRESSIVE_TOUCH", "1"),
+            touch_min_requote_s=float(_e("TOUCH_MIN_REQUOTE_S", "0.2")),
+            use_depth_imbalance=_b("USE_DEPTH_IMBALANCE", "1"),
+            imbalance_levels=int(_e("IMBALANCE_LEVELS", "7")),
+            imbalance_widen_bps=_d("IMBALANCE_WIDEN_BPS", "4.0"),
+            imbalance_size_cut=_d("IMBALANCE_SIZE_CUT", "0.3"),
+            continue_add_after_reduce=_b("CONTINUE_ADD_AFTER_REDUCE", "1"),
+            run_tag=str(_e("RUN_TAG", "default")),
+            markout_horizons_s=str(_e("MARKOUT_HORIZONS_S", "1,5,30")),
             enable_smart_inventory_mgmt=_b("ENABLE_SMART_INVENTORY_MGMT", "1"),
             taker_fee_bps=_d("TAKER_FEE_BPS", "2.2"),
             emergency_taker_loss_bps=_d("EMERGENCY_TAKER_LOSS_BPS", "6.0"),

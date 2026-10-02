@@ -114,7 +114,7 @@ class OnlineLearner:
 
         # Hard mathematical & safety bounds [min_val, max_val]
         self.bounds = {
-            "min_edge_bps": (Decimal("0.2"), Decimal("6.0")),
+            "min_edge_bps": (max(Decimal("0.2"), self.base["min_edge_bps"]), Decimal("6.0")),
             "max_edge_bps": (Decimal("2.0"), Decimal("20.0")),
             "skew_bps": (Decimal("0.5"), Decimal("35.0")),
             "level_spacing_bps": (Decimal("1.0"), Decimal("15.0")),
@@ -292,16 +292,16 @@ class OnlineLearner:
         self.last_change_reason = reason
         self.last_changes = [f"{name}: {float(old):.2f} -> {float(new):.2f}" for name, old, new in diffs]
 
-        lines = ["LEARN"]
-        for name, old, new in diffs:
-            lines.append(f"{name + ':':<8} {float(old):.2f} -> {float(new):.2f}")
-        lines.append(f"{'reason:':<8} {reason}")
-        if context:
-            for k, val in context.items():
-                lines.append(f"{k}: {val}")
-
-        nl = chr(10)
-        log.info(nl + nl.join(lines))
+        if log.isEnabledFor(logging.DEBUG):
+            lines = ["LEARN"]
+            for name, old, new in diffs:
+                lines.append(f"{name + ':':<8} {float(old):.2f} -> {float(new):.2f}")
+            lines.append(f"{'reason:':<8} {reason}")
+            if context:
+                for k, val in context.items():
+                    lines.append(f"{k}: {val}")
+            nl = chr(10)
+            log.debug(nl + nl.join(lines))
 
     def tick_decay(self, now: float) -> None:
         """Gradually relaxes learned parameters toward base config during idle/no-fill periods."""
@@ -555,6 +555,8 @@ class OnlineLearner:
                 for k, v in data["params"].items():
                     if k in self.params:
                         self.params[k] = Decimal(str(v))
+                if "min_edge_bps" in self.params:
+                    self.params["min_edge_bps"] = max(self.params["min_edge_bps"], self.base["min_edge_bps"])
                 self.n_markouts = int(data.get("n_markouts", 0))
                 self.n_toxic = int(data.get("n_toxic", 0))
                 self.n_benign = int(data.get("n_benign", 0))
@@ -652,8 +654,9 @@ class Ledger:
 
         edge = (mid - price) if side == BUY else (price - mid)
         edge_bps = edge / mid * BPS if mid else ZERO
-        self.spread_capture += edge * qty
-        self.spread_edge_bps_sum += edge_bps
+        if is_maker:
+            self.spread_capture += edge * qty
+            self.spread_edge_bps_sum += edge_bps
         self.volume_usd += qty * price
         self.n_fills += 1
         self.n_buys += (side == BUY)

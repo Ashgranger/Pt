@@ -12,7 +12,7 @@ from typing import Callable, Optional, Dict, Tuple, List
 from exchange import Exchange
 from market import Market
 from signer import Signer
-from utils import BUY, SELL, fmt, bps_diff
+from utils import BUY, SELL, fmt, bps_diff, q_down, q_up
 
 log = logging.getLogger("orders")
 GTT_DAYS = 40
@@ -110,8 +110,14 @@ class OrderManager:
                     time_in_force: str = "ALO", reduce_only: bool = False) -> Optional[Order]:
         if now < self.paused_until or not self._budget(now):
             return None
+        m = self.get_market()
+        tick = m.tick_for(px) if hasattr(m, "tick_for") else m.tick
+        px = q_down(px, tick) if side == BUY else q_up(px, tick)
+        qty = q_down(qty, m.step)
+        if qty < m.min_size or (m.min_notional > 0 and px * qty < m.min_notional):
+            return None
         good_til = int(time.time() * 1_000_000) + GTT_DAYS * 86_400 * 1_000_000
-        req = self.signer.place(self.get_market(), side, px, qty, good_til,
+        req = self.signer.place(m, side, px, qty, good_til,
                                 time_in_force=time_in_force, reduce_only=reduce_only)
         self.maybe_orders = True
         self.last_place_ts = now
@@ -141,8 +147,11 @@ class OrderManager:
             if urgent:
                 await self.cancel(o, now)
             return False
+        m = self.get_market()
+        tick = m.tick_for(px) if hasattr(m, "tick_for") else m.tick
+        px = q_down(px, tick) if o.side == BUY else q_up(px, tick)
         r_only = o.is_reduce_only if reduce_only is None else reduce_only
-        req = self.signer.modify(self.get_market(), o.order_id, o.side, px, o.qty, o.good_til_us, reduce_only=r_only)
+        req = self.signer.modify(m, o.order_id, o.side, px, o.qty, o.good_til_us, reduce_only=r_only)
         resp = await self.ex.write(req)
         if not self._ok(resp):
             self._error(f"modify L{o.pair_index} {o.side}", resp, now)
@@ -188,9 +197,26 @@ class OrderManager:
         if not force and not self.orders and not self.maybe_orders:
             return
         m = self.get_market()
-        body = {"address": self.cfg.address, "accountIndex": self.cfg.account_index, "marketId": m.market_id}
-        resp = await self.ex.write(self.signer.legacy("cancelAllOrders", body))
-        log.info("CANCEL-ALL sent (status %s)", resp.get("status"))
+        now = time.time()
+        for o in list(self.orders.values()):
+            await self.cancel(o, now)
+
+        if (force or self.maybe_orders) and not self.cfg.dry_run and getattr(self.ex, "is_connected", False):
+            try:
+                res = await self.ex.get("orders", {"address": self.cfg.address, "accountIndex": self.cfg.account_index,
+                                                    "marketId": m.market_id})
+                if res and "openOrders" in res:
+                    for r in res["openOrders"]:
+                        if isinstance(r, dict):
+                            r_mkt = r.get("marketId")
+                            if r_mkt is not None and int(r_mkt) != m.market_id:
+                                continue
+                            oid = str(r.get("orderId") or r.get("id"))
+                            if oid and oid != "None" and oid not in self.orders:
+                                await self.ex.write(self.signer.cancel(m, oid))
+            except Exception:
+                pass
+
         self.orders.clear()
         self.pair_slots.clear()
         self.maybe_orders = False
@@ -232,7 +258,7 @@ class OrderManager:
                 if is_retreating and drift >= self.cfg.retreat_bps:
                     should_modify = True
                     urgent = True
-                elif is_advancing and drift >= self.cfg.requote_bps and (now - existing.last_action >= self.cfg.min_requote_s):
+                elif is_advancing and drift >= self.cfg.requote_bps and (now - existing.last_action >= (getattr(self.cfg, "touch_min_requote_s", self.cfg.min_requote_s) if existing.pair_index == 0 else self.cfg.min_requote_s)):
                     queue_reset_cost = getattr(self.cfg, "queue_reset_cost_bps", Decimal("0.20"))
                     ev_gain = getattr(t, "expected_value_bps", Decimal(0)) - getattr(existing, "ev_bps", Decimal(0))
                     if ev_gain >= queue_reset_cost or drift >= (self.cfg.requote_bps * Decimal("1.5")):
@@ -251,6 +277,13 @@ class OrderManager:
     def on_update(self, c, now: float) -> None:
         if not isinstance(c, dict) or not c.get("orderId"):
             return
+        mkt_id = c.get("marketId")
+        if mkt_id is not None:
+            try:
+                if int(mkt_id) != self.get_market().market_id:
+                    return
+            except Exception:
+                pass
         oid = str(c["orderId"])
         o = self.orders.get(oid)
         if o is None:
@@ -300,7 +333,21 @@ class OrderManager:
             self._remove_order(o.order_id)
 
     async def reconcile(self, rows: list, now: float) -> None:
-        open_ids = {str(r.get("orderId") or r.get("id")) for r in rows}
+        m = self.get_market()
+        market_rows = []
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            r_mkt = r.get("marketId")
+            if r_mkt is not None:
+                try:
+                    if int(r_mkt) != m.market_id:
+                        continue
+                except (ValueError, TypeError):
+                    pass
+            market_rows.append(r)
+
+        open_ids = {str(r.get("orderId") or r.get("id")) for r in market_rows}
         for o in list(self.orders.values()):
             if o.order_id not in open_ids and now - o.last_action > 5 and o.cancelling_since is None:
                 log.warning("dropping ghost L%d %s order %s", o.pair_index, o.side, o.order_id)
@@ -312,5 +359,5 @@ class OrderManager:
         for oid in (open_ids - mine - recent_closed):
             if oid and oid != "None":
                 self._recently_closed.append((now, oid))
-                log.warning("cancelling orphan order %s", oid)
-                await self.ex.write(self.signer.cancel(self.get_market(), oid))
+                log.warning("cancelling orphan order %s for market %s (id %d)", oid, m.name, m.market_id)
+                await self.ex.write(self.signer.cancel(m, oid))

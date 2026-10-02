@@ -649,5 +649,51 @@ class TestLevel7MarketMaker(unittest.IsolatedAsyncioTestCase):
             os.remove(test_log)
         print("✓ test_26_quote_opportunity_dataset_logging passed: High-frequency quote opportunity dataset verified.")
 
+    async def test_27_positive_spread_capture_and_no_mid_crossing(self):
+        """Verify that ladder quotes never cross mid, maintain monotonic depth, and capture strictly positive spread."""
+        bot, s, clock = sim.make(
+            MARKET="PUMP-USD",
+            MIN_EDGE_BPS="3.5",
+            MAX_EDGE_BPS="20.0",
+            EXTRA_LEVELS=2,
+            LEVEL_SPACING_BPS="3.0",
+            ENABLE_SELECTIVE_TOUCH=1,
+            ORDER_USD=50,
+            MAX_POSITION_USD=180
+        )
+        m_pump = sim.Market(10, "PUMP-USD", "ONLINE", D("0.000001"), D("1"), [], D("5"), D("1"), D("1000000"), D("0.005025"), False)
+        bot.md.info = m_pump
+        bot.md.info_ts = clock.t
+        bot.md.update(D("0.005000"), D("0.005050"), D("100000"), D("100000"), clock.t)
+
+        quotes = bot.engine.generate_ladder_quotes(m_pump, bot.md, bot.ledger, clock.t, False, False)
+        mid = bot.md.mid
+
+        buy_quotes = [q for q in quotes if q.side == BUY]
+        sell_quotes = [q for q in quotes if q.side == SELL]
+
+        self.assertGreaterEqual(len(buy_quotes), 1)
+        self.assertGreaterEqual(len(sell_quotes), 1)
+
+        # 1. Verify every BUY quote is strictly below mid, and every SELL quote is strictly above mid
+        for q in buy_quotes:
+            self.assertLess(q.price, mid, f"BUY quote {q.price} must be strictly less than mid {mid}")
+        for q in sell_quotes:
+            self.assertGreater(q.price, mid, f"SELL quote {q.price} must be strictly greater than mid {mid}")
+
+        # 2. Verify ladder depth monotonicity
+        for i in range(len(buy_quotes) - 1):
+            self.assertLess(buy_quotes[i+1].price, buy_quotes[i].price, "BUY ladder must descend into the book")
+        for i in range(len(sell_quotes) - 1):
+            self.assertGreater(sell_quotes[i+1].price, sell_quotes[i].price, "SELL ladder must ascend into the book")
+
+        # 3. Simulate a fill at L0 BUY and verify positive spread capture
+        l0_buy = buy_quotes[0]
+        bot.ledger.on_fill(BUY, l0_buy.qty, l0_buy.price, mid, clock.t, True)
+        self.assertGreater(bot.ledger.spread_capture, D("0"), "Spread capture must be strictly positive")
+        self.assertGreater(bot.ledger.avg_edge_bps, D("0"), "Average edge bps must be strictly positive")
+
+        print(f"✓ test_27_positive_spread_capture_and_no_mid_crossing passed: All quotes strictly respect mid and capture positive spread.")
+
 if __name__ == "__main__":
     unittest.main()

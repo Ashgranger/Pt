@@ -27,6 +27,9 @@ def q_up(x: Decimal, unit: Decimal) -> Decimal:
 def to_int(value: Decimal, unit: Decimal) -> int:
     """Exact decimal -> integer ticks/quantums (the signed payload needs exactness)."""
     n = value / unit
+    rounded = round(n)
+    if abs(n - rounded) < Decimal("0.00001"):
+        return int(rounded)
     if n != n.to_integral_value():
         raise ValueError(f"{value} is not a multiple of {unit}")
     return int(n)
