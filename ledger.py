@@ -401,7 +401,7 @@ class OnlineLearner:
         self._clamp_all()
         ctx = {f"markout_{h_str}": f"{float(m_bps):+.2f}bps"}
         self._log_param_diff(reason, old_params, ctx)
-        self.save_soon()
+        self.save()
 
 
     def predict_markout(self, side: str, regime: str, level: int = 0, horizon: float = 2.0) -> Decimal:
@@ -447,7 +447,7 @@ class OnlineLearner:
 
         self._clamp_all()
         self._log_param_diff(reason, old_params, ctx)
-        self.save_soon()
+        self.save()
 
     def on_flow_correlation(self, obi: Decimal, tfi: Decimal, ret_bps: Decimal) -> None:
         """Adapts order-book and trade-flow imbalance weights based on forward price prediction accuracy."""
@@ -490,7 +490,7 @@ class OnlineLearner:
             reason = "turnover_healthy_margin"
         self._clamp_all()
         self._log_param_diff(reason, old_params, {"realized_bps": f"{float(realized_bps):.2f}"})
-        self.save_soon()
+        self.save()
 
     def get_summary(self) -> Dict[str, Any]:
         return {
@@ -505,24 +505,6 @@ class OnlineLearner:
             "last_change_reason": self.last_change_reason,
             "params": {k: f"{v:.4f}" for k, v in self.params.items()},
         }
-
-    save_interval: float = 0.0  # 0 = save immediately (default); bot sets >0 for live trading
-
-    def save_soon(self, interval: Optional[float] = None) -> None:
-        """Throttled save: never blocks the hot path more than once per `interval`."""
-        if interval is None:
-            interval = self.save_interval
-        t = time.monotonic()
-        if t - getattr(self, "_last_save_t", 0.0) >= interval:
-            self._last_save_t = t
-            self._save_dirty = False
-            self.save()
-        else:
-            self._save_dirty = True
-
-    def flush(self) -> None:
-        if getattr(self, "_save_dirty", False):
-            self.save_soon()
 
     def save(self, path: Optional[str] = None) -> bool:
         """Persists learned parameters atomically to disk."""
@@ -711,19 +693,9 @@ class Ledger:
     def _calc_weighted_markout(self, buf: deque) -> Decimal:
         if not buf:
             return ZERO
-        now = self._now()
-        memo = self.__dict__.setdefault("_wm_memo", {})
-        last = buf[-1]
-        hit = memo.get(id(buf))
-        if hit is not None and hit[0] == now and hit[1] == len(buf) and hit[2] is last:
-            return hit[3]
-        res = self._calc_weighted_markout_raw(buf, now)
-        memo[id(buf)] = (now, len(buf), last, res)
-        return res
-
-    def _calc_weighted_markout_raw(self, buf: deque, now: float) -> Decimal:
         weighted_sum = ZERO
         weight_total = ZERO
+        now = self._now()
         for item in buf:
             if isinstance(item, tuple):
                 ts, val = item

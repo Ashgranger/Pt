@@ -14,14 +14,6 @@ from utils import Fatal
 log = logging.getLogger("exchange")
 
 try:
-    import orjson as _orjson
-    _loads = _orjson.loads
-    _dumps = lambda o: _orjson.dumps(o).decode()
-except ImportError:  # graceful fallback
-    _loads = json.loads
-    _dumps = json.dumps
-
-try:
     from websockets.exceptions import ConnectionClosed
 except ImportError:
     class ConnectionClosed(Exception):
@@ -47,7 +39,7 @@ class Exchange:
         if not self.is_connected:
             return False
         try:
-            await self.ws.send(_dumps(obj))
+            await self.ws.send(json.dumps(obj))
             return True
         except (ConnectionClosed, ConnectionResetError, BrokenPipeError, OSError) as e:
             log.warning("WebSocket send failed (closed): %s", e)
@@ -100,8 +92,8 @@ class Exchange:
 
     def handle_message(self, raw) -> None:
         try:
-            msg = _loads(raw)
-        except ValueError:
+            msg = json.loads(raw)
+        except json.JSONDecodeError:
             return
         mtype = msg.get("type")
         if mtype in ("channel_data", "subscribed"):

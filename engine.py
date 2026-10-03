@@ -174,8 +174,7 @@ class MarketMakingEngine:
         rem = qty
         total_cost = ZERO
         for row in depth:
-            px = row[0] if isinstance(row[0], Decimal) else Decimal(str(row[0]))
-            sz = row[1] if isinstance(row[1], Decimal) else Decimal(str(row[1]))
+            px, sz = Decimal(str(row[0])), Decimal(str(row[1]))
             filled = min(rem, sz)
             total_cost += filled * px
             rem -= filled

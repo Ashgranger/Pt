@@ -9,10 +9,6 @@ from typing import Optional, List, Tuple
 from utils import BPS, ZERO, ONE, clamp
 
 
-def _D(x) -> Decimal:
-    return x if isinstance(x, Decimal) else Decimal(str(x))
-
-
 @dataclass
 class Market:
     market_id: int
@@ -153,8 +149,6 @@ class MarketData:
         self.jump_until = 0.0
         self._hist: deque = deque()
         self._trades: deque = deque()
-        self._tfi_cache: dict = {}
-        self._tfi_now = None
         self._vol_ewma = ZERO
         self._book_depth_bids: list = []
         self._book_depth_asks: list = []
@@ -184,18 +178,12 @@ class MarketData:
 
     def on_trade(self, side: str, size: Decimal, price: Decimal, now: float) -> None:
         self._trades.append((now, side.upper(), size, price))
-        self._tfi_cache.clear()
-        self._tfi_now = None
         while self._trades and now - self._trades[0][0] > 60.0:
             self._trades.popleft()
 
     def on_depth(self, bids: list, asks: list, now: float) -> None:
-        try:
-            self._book_depth_bids = [(_D(r[0]), _D(r[1])) for r in bids]
-            self._book_depth_asks = [(_D(r[0]), _D(r[1])) for r in asks]
-        except Exception:
-            self._book_depth_bids = bids
-            self._book_depth_asks = asks
+        self._book_depth_bids = bids
+        self._book_depth_asks = asks
 
     def update_cross_venue(self, venue: str, bid: Decimal, ask: Decimal,
                            bid_sz: Decimal, ask_sz: Decimal, now: float) -> None:
@@ -223,26 +211,18 @@ class MarketData:
         return (self.bid_sz - self.ask_sz) / total
 
     def trade_flow_imbalance(self, window_s: float, now: float) -> Decimal:
-        if self._tfi_now != now:
-            self._tfi_cache.clear()
-            self._tfi_now = now
-        else:
-            hit = self._tfi_cache.get(window_s)
-            if hit is not None:
-                return hit
         buy_vol = ZERO
         sell_vol = ZERO
-        for t, side, sz, _ in reversed(self._trades):
-            if now - t > window_s:
-                break
-            if side in ("BUY", "BID"):
-                buy_vol += sz
-            else:
-                sell_vol += sz
+        for t, side, sz, _ in self._trades:
+            if now - t <= window_s:
+                if side in ("BUY", "BID"):
+                    buy_vol += sz
+                else:
+                    sell_vol += sz
         total = buy_vol + sell_vol
-        res = ZERO if total <= 0 else (buy_vol - sell_vol) / total
-        self._tfi_cache[window_s] = res
-        return res
+        if total <= 0:
+            return ZERO
+        return (buy_vol - sell_vol) / total
 
     @property
     def spread_bps(self) -> Decimal:
@@ -256,39 +236,16 @@ class MarketData:
         return [m for t, m in self._hist if now - t <= window_s]
 
     def ret_bps(self, window_s: float, now: float) -> Decimal:
-        newest = oldest = None
-        n = 0
-        for t, m in reversed(self._hist):
-            if now - t > window_s:
-                break
-            if newest is None:
-                newest = m
-            oldest = m
-            n += 1
-        if n < 2 or oldest == 0:
+        w = self._window(window_s, now)
+        if len(w) < 2 or w[0] == 0:
             return ZERO
-        return (newest - oldest) / oldest * BPS
+        return (w[-1] - w[0]) / w[0] * BPS
 
     def move_bps(self, window_s: float, now: float) -> Decimal:
-        newest = oldest = hi = lo = None
-        n = 0
-        for t, m in reversed(self._hist):
-            if now - t > window_s:
-                break
-            if newest is None:
-                newest = hi = lo = m
-            else:
-                if m > hi:
-                    hi = m
-                elif m < lo:
-                    lo = m
-            oldest = m
-            n += 1
-        if n < 2:
+        w = self._window(window_s, now)
+        if len(w) < 2 or w[0] == 0:
             return ZERO
-        if oldest == 0:
-            return ZERO
-        return (hi - lo) / newest * BPS
+        return (max(w) - min(w)) / w[-1] * BPS
 
     @property
     def vol_bps(self) -> Decimal:
@@ -312,7 +269,7 @@ class MarketData:
                 return self.bid_sz or Decimal("1")
             ahead = ZERO
             for row in self._book_depth_bids:
-                p, sz = _D(row[0]), _D(row[1])
+                p, sz = Decimal(str(row[0])), Decimal(str(row[1]))
                 if p >= price:
                     ahead += sz
                 else:
@@ -323,7 +280,7 @@ class MarketData:
                 return self.ask_sz or Decimal("1")
             ahead = ZERO
             for row in self._book_depth_asks:
-                p, sz = _D(row[0]), _D(row[1])
+                p, sz = Decimal(str(row[0])), Decimal(str(row[1]))
                 if p <= price:
                     ahead += sz
                 else:
@@ -334,11 +291,10 @@ class MarketData:
         """Aggressive trade volume hitting the given book side per second."""
         vol = ZERO
         target_trade_side = "SELL" if side in ("BUY", "BID") else "BUY"
-        for t, s, sz, _ in reversed(self._trades):
-            if now - t > window_s:
-                break
-            if s == target_trade_side:
-                vol += sz
+        for t, s, sz, _ in self._trades:
+            if now - t <= window_s:
+                if s == target_trade_side:
+                    vol += sz
         return vol / Decimal(str(max(0.1, window_s)))
 
     def liquidity_fragility(self, side: str, now: float) -> Decimal:
@@ -346,7 +302,7 @@ class MarketData:
         A fragility value > 0.5 indicates resting liquidity is being consumed rapidly (imminent level sweep)."""
         cons = self.consumption_rate(side, 1.0, now)
         depth_list = self._book_depth_bids[:5] if side in ("BUY", "BID") else self._book_depth_asks[:5]
-        depth = sum(_D(r[1]) for r in depth_list) if depth_list else ZERO
+        depth = sum(Decimal(str(r[1])) for r in depth_list) if depth_list else ZERO
         if depth <= ZERO:
             depth = (self.bid_sz if side in ("BUY", "BID") else self.ask_sz) or Decimal("1")
         return cons / max(Decimal("0.01"), depth)
@@ -355,8 +311,8 @@ class MarketData:
         """Volume-weighted order book imbalance across the top N book levels."""
         if not self._book_depth_bids or not self._book_depth_asks:
             return self.obi
-        bid_v = sum(_D(r[1]) for r in self._book_depth_bids[:levels])
-        ask_v = sum(_D(r[1]) for r in self._book_depth_asks[:levels])
+        bid_v = sum(Decimal(str(r[1])) for r in self._book_depth_bids[:levels])
+        ask_v = sum(Decimal(str(r[1])) for r in self._book_depth_asks[:levels])
         tot = bid_v + ask_v
         if tot <= ZERO:
             return ZERO
@@ -398,15 +354,14 @@ class MarketData:
         """Returns (buy_qty_per_s, sell_qty_per_s, buy_usd_per_s, sell_usd_per_s)."""
         buy_qty, sell_qty = ZERO, ZERO
         buy_usd, sell_usd = ZERO, ZERO
-        for t, s, sz, px in reversed(self._trades):
-            if now - t > window_s:
-                break
-            if s in ("BUY", "BID"):
-                buy_qty += sz
-                buy_usd += sz * px
-            else:
-                sell_qty += sz
-                sell_usd += sz * px
+        for t, s, sz, px in self._trades:
+            if now - t <= window_s:
+                if s in ("BUY", "BID"):
+                    buy_qty += sz
+                    buy_usd += sz * px
+                else:
+                    sell_qty += sz
+                    sell_usd += sz * px
         dt = Decimal(str(max(0.1, window_s)))
         return (buy_qty / dt, sell_qty / dt, buy_usd / dt, sell_usd / dt)
 
@@ -425,8 +380,8 @@ class MarketData:
         depth_list = self._book_depth_bids[:levels] if side in ("BUY", "BID") else self._book_depth_asks[:levels]
         if not depth_list:
             return Decimal("1.0")
-        l0_sz = _D(depth_list[0][1])
-        tot_sz = sum(_D(r[1]) for r in depth_list)
+        l0_sz = Decimal(str(depth_list[0][1]))
+        tot_sz = sum(Decimal(str(r[1])) for r in depth_list)
         return (l0_sz / tot_sz) if tot_sz > ZERO else Decimal("1.0")
 
     def get_microstructure_snapshot(self, m: Optional[Market], now: float) -> dict:
