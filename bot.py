@@ -65,6 +65,9 @@ class MarketMaker:
         self._last_logged_realized: Decimal = ZERO
         self._tick_lock = asyncio.Lock()
         self._dirty_evt = asyncio.Event()
+        self._bg_tasks: dict = {}
+        self._files: dict = {}
+        self._tick_on_trades = os.getenv("TICK_ON_TRADES", "1").strip().lower() in ("1", "true", "yes", "on")
 
     def _get_market(self) -> Market:
         if not self.md.info:
@@ -97,6 +100,8 @@ class MarketMaker:
                     self._handle_trade(tr, now)
             elif isinstance(contents, dict):
                 self._handle_trade(contents, now)
+            if self._tick_on_trades:
+                self._dirty_evt.set()
 
         elif channel in ("l2Orderbook", "l2OrderbookUpdates", "orderBook"):
             if isinstance(contents, dict):
@@ -199,6 +204,28 @@ class MarketMaker:
         self._journal(fill)
         self._dirty_evt.set()
 
+    def _fp(self, path: str):
+        fp = self._files.get(path)
+        if fp is None or fp.closed:
+            fp = open(path, "a", buffering=1)
+            self._files[path] = fp
+        return fp
+
+    def _close_files(self) -> None:
+        for fp in self._files.values():
+            try:
+                fp.close()
+            except Exception:
+                pass
+        self._files.clear()
+
+    def _spawn_bg(self, name: str, coro_fn, now: float) -> None:
+        """Run slow network housekeeping off the quoting loop (one in flight per name)."""
+        t = self._bg_tasks.get(name)
+        if t is not None and not t.done():
+            return
+        self._bg_tasks[name] = asyncio.create_task(coro_fn(now))
+
     def _journal(self, f: Fill) -> None:
         if not self.cfg.journal_path or self.cfg.journal_path == os.devnull:
             return
@@ -209,8 +236,7 @@ class MarketMaker:
             "fees": fmt(self.ledger.fees)
         }
         try:
-            with open(self.cfg.journal_path, "a") as fp:
-                fp.write(json.dumps(row) + "\n")
+            self._fp(self.cfg.journal_path).write(json.dumps(row) + "\n")
         except Exception:
             pass
 
@@ -242,8 +268,7 @@ class MarketMaker:
                     for q in targets
                 ]
             }
-            with open(self.cfg.quote_dataset_path, "a") as fp:
-                fp.write(json.dumps(record) + chr(10))
+            self._fp(self.cfg.quote_dataset_path).write(json.dumps(record) + chr(10))
         except Exception:
             pass
 
@@ -255,6 +280,7 @@ class MarketMaker:
             if hasattr(self.ledger, "learner") and (now - getattr(self, "_last_decay_call", 0.0) >= 1.0):
                 self._last_decay_call = now
                 self.ledger.learner.tick_decay(now)
+                self.ledger.learner.flush()
             m = self.md.info
             if not m:
                 return
@@ -411,6 +437,8 @@ class MarketMaker:
                      m1s, m5s, m_avg, wr, afr, pnl_delta, inv_pnl_str, cap_spr, vol_str, fills_str)
 
     async def run(self) -> None:
+        if self.cfg.enable_online_learning and hasattr(self.ledger, "learner"):
+            self.ledger.learner.save_interval = 1.0  # keep disk I/O off the hot path
         log.info("Connecting to %s Arcus WS (%s)...", self.cfg.env_name, self.ex.ws_url)
         raw_markets = await self.ex.fetch_markets(self.cfg.market)
         self.md.info = Market.from_api(raw_markets[0])
@@ -441,7 +469,8 @@ class MarketMaker:
                     ping_interval=15,
                     ping_timeout=20,
                     max_size=2**23,
-                    close_timeout=5
+                    close_timeout=5,
+                    compression=None
                 ) as ws:
                     self.ex.ws = ws
                     reader_task = asyncio.create_task(self.ex.reader())
@@ -462,8 +491,8 @@ class MarketMaker:
 
                     while not self.stop_evt.is_set() and self.ex.is_connected:
                         now = self.now()
-                        await self._heartbeat(now)
-                        await self._reconcile(now)
+                        self._spawn_bg("heartbeat", self._heartbeat, now)
+                        self._spawn_bg("reconcile", self._reconcile, now)
                         self._status_log(now)
 
                         await self.tick()
@@ -479,6 +508,9 @@ class MarketMaker:
             except Exception as e:
                 log.error("Error in bot run loop: %s", e, exc_info=True)
             finally:
+                for _t in self._bg_tasks.values():
+                    if not _t.done():
+                        _t.cancel()
                 if reader_task and not reader_task.done():
                     reader_task.cancel()
                     try:
@@ -499,3 +531,4 @@ class MarketMaker:
             await self.om.cancel_all()
         except Exception:
             pass
+        self._close_files()
