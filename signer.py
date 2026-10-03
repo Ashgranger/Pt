@@ -89,6 +89,14 @@ class Signer:
                 "timeInForce": "ALO", "reduceOnly": bool(reduce_only), "goodTilTime": str(good_til_us)}
         return self._envelope("modifyOrder", body, msg, ts)
 
+    def schedule_cancel(self, m: Market, deadline_us: "int | None") -> dict:
+        """Dead man's switch. deadline_us = absolute epoch microseconds (5s-5min ahead) to arm/refresh;
+        None disarms. Scoped to one market so other bots on the account are unaffected."""
+        body = {"address": self.address, "accountIndex": self.ai, "marketId": m.market_id}
+        if deadline_us is not None:
+            body["time"] = int(deadline_us)
+        return self.legacy("scheduleCancel", body)
+
     def legacy(self, action: str, body: dict) -> dict:
         ts = self.next_ts()
         return self._envelope(action, body, f"{ts}{action}{canonical(body)}", ts)

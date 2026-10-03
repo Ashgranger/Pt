@@ -1,6 +1,7 @@
 """Order book of *our own* orders with Multi-Pair Individual Order Management."""
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -194,26 +195,41 @@ class OrderManager:
             if self.pair_slots.get(slot) == order_id:
                 self.pair_slots.pop(slot, None)
 
+    async def _gather(self, coros) -> None:
+        coros = list(coros)
+        if not coros:
+            return
+        if len(coros) == 1:
+            await coros[0]
+            return
+        for r in await asyncio.gather(*coros, return_exceptions=True):
+            if isinstance(r, asyncio.CancelledError):
+                raise r
+            if isinstance(r, Exception):
+                log.warning("parallel order action failed: %r", r)
+
     async def cancel_side(self, side: str, now: float) -> None:
+        coros = []
         for slot, oid in list(self.pair_slots.items()):
             if slot[1] == side:
                 o = self.orders.get(oid)
                 if o:
-                    await self.cancel(o, now)
+                    coros.append(self.cancel(o, now))
+        await self._gather(coros)
 
     async def cancel_all(self, force: bool = False) -> None:
         if not force and not self.orders and not self.maybe_orders:
             return
         m = self.get_market()
         now = time.time()
-        for o in list(self.orders.values()):
-            await self.cancel(o, now)
+        await self._gather([self.cancel(o, now) for o in list(self.orders.values())])
 
         if (force or self.maybe_orders) and not self.cfg.dry_run and getattr(self.ex, "is_connected", False):
             try:
                 res = await self.ex.get("orders", {"address": self.cfg.address, "accountIndex": self.cfg.account_index,
                                                     "marketId": m.market_id})
                 if res and "openOrders" in res:
+                    reqs = []
                     for r in res["openOrders"]:
                         if isinstance(r, dict):
                             r_mkt = r.get("marketId")
@@ -221,7 +237,8 @@ class OrderManager:
                                 continue
                             oid = str(r.get("orderId") or r.get("id"))
                             if oid and oid != "None" and oid not in self.orders:
-                                await self.ex.write(self.signer.cancel(m, oid))
+                                reqs.append(self.ex.write(self.signer.cancel(m, oid)))
+                    await self._gather(reqs)
             except Exception:
                 pass
 
@@ -231,65 +248,77 @@ class OrderManager:
 
     async def sync_quotes(self, targets: list, now: float, blocked_sides: Optional[set] = None) -> None:
         active_slots = set()
-        
+        groups: dict = {}
         for t in targets:
             slot = (t.pair_index, t.side)
-            existing = self.get_order_by_slot(t.pair_index, t.side)
-            
-            if getattr(t, "is_taker", False):
-                if existing:
-                    await self.cancel(existing, now)
-                    self.pair_slots.pop(slot, None)
-                await self.place(t.pair_index, t.side, t.price, t.qty, now,
-                                 time_in_force="IOC", reduce_only=True,
-                                 quote_mid=getattr(t, "quote_mid", None))
-                continue
+            groups.setdefault(slot, []).append(t)
+            if not getattr(t, "is_taker", False):
+                active_slots.add(slot)
 
-            active_slots.add(slot)
-            is_exit = bool(getattr(t, "is_exit_quote", False))
-            if existing is None:
-                if now >= self.reject_until[t.side]:
-                    o_new = await self.place(t.pair_index, t.side, t.price, t.qty, now,
-                                             time_in_force="ALO", reduce_only=is_exit,
-                                             quote_mid=getattr(t, "quote_mid", None))
-                    if o_new:
-                        o_new.ev_bps = getattr(t, "expected_value_bps", Decimal(0))
-            else:
-                drift = abs(bps_diff(t.price, existing.price))
-                is_advancing = (t.side == BUY and t.price > existing.price) or (t.side == SELL and t.price < existing.price)
-                is_retreating = not is_advancing
+        async def run_group(ts: list) -> None:
+            for t in ts:  # same-slot targets stay strictly sequential
+                await self._sync_one(t, now)
 
-                should_modify = False
-                urgent = False
-
-                if getattr(existing, "is_reduce_only", False) != is_exit:
-                    should_modify = True
-                    urgent = True
-
-                m = self.get_market()
-                tick_bps = (m.tick / existing.price) * Decimal("10000") if existing.price > 0 else Decimal("0.1")
-                eff_retreat = min(self.cfg.retreat_bps, tick_bps * Decimal("0.9"))
-                eff_requote = min(self.cfg.requote_bps, tick_bps * Decimal("0.9"))
-
-                if is_retreating and (drift >= eff_retreat or abs(t.price - existing.price) >= m.tick):
-                    should_modify = True
-                    urgent = True
-                elif is_advancing and (drift >= eff_requote or abs(t.price - existing.price) >= m.tick) and (now - existing.last_action >= (getattr(self.cfg, "touch_min_requote_s", self.cfg.min_requote_s) if existing.pair_index == 0 else self.cfg.min_requote_s)):
-                    queue_reset_cost = getattr(self.cfg, "queue_reset_cost_bps", Decimal("0.20"))
-                    ev_gain = getattr(t, "expected_value_bps", Decimal(0)) - getattr(existing, "ev_bps", Decimal(0))
-                    if ev_gain >= queue_reset_cost or drift >= (self.cfg.requote_bps * Decimal("1.5")) or abs(t.price - existing.price) >= m.tick:
-                        should_modify = True
-
-                if should_modify:
-                    if await self.modify(existing, t.price, now, urgent=urgent, reduce_only=is_exit):
-                        existing.ev_bps = getattr(t, "expected_value_bps", Decimal(0))
-                        existing.quote_mid = getattr(t, "quote_mid", None)
-
+        coros = [run_group(ts) for ts in groups.values()]
         for slot, oid in list(self.pair_slots.items()):
             if slot not in active_slots:
                 o = self.orders.get(oid)
                 if o:
-                    await self.cancel(o, now)
+                    coros.append(self.cancel(o, now))
+        await self._gather(coros)
+
+    async def _sync_one(self, t, now: float) -> None:
+        slot = (t.pair_index, t.side)
+        existing = self.get_order_by_slot(t.pair_index, t.side)
+
+        if getattr(t, "is_taker", False):
+            if existing:
+                await self.cancel(existing, now)
+                self.pair_slots.pop(slot, None)
+            await self.place(t.pair_index, t.side, t.price, t.qty, now,
+                             time_in_force="IOC", reduce_only=True,
+                             quote_mid=getattr(t, "quote_mid", None))
+            return
+
+        is_exit = bool(getattr(t, "is_exit_quote", False))
+        if existing is None:
+            if now >= self.reject_until[t.side]:
+                o_new = await self.place(t.pair_index, t.side, t.price, t.qty, now,
+                                         time_in_force="ALO", reduce_only=is_exit,
+                                         quote_mid=getattr(t, "quote_mid", None))
+                if o_new:
+                    o_new.ev_bps = getattr(t, "expected_value_bps", Decimal(0))
+            return
+
+        drift = abs(bps_diff(t.price, existing.price))
+        is_advancing = (t.side == BUY and t.price > existing.price) or (t.side == SELL and t.price < existing.price)
+        is_retreating = not is_advancing
+
+        should_modify = False
+        urgent = False
+
+        if getattr(existing, "is_reduce_only", False) != is_exit:
+            should_modify = True
+            urgent = True
+
+        m = self.get_market()
+        tick_bps = (m.tick / existing.price) * Decimal("10000") if existing.price > 0 else Decimal("0.1")
+        eff_retreat = min(self.cfg.retreat_bps, tick_bps * Decimal("0.9"))
+        eff_requote = min(self.cfg.requote_bps, tick_bps * Decimal("0.9"))
+
+        if is_retreating and (drift >= eff_retreat or abs(t.price - existing.price) >= m.tick):
+            should_modify = True
+            urgent = True
+        elif is_advancing and (drift >= eff_requote or abs(t.price - existing.price) >= m.tick) and (now - existing.last_action >= (getattr(self.cfg, "touch_min_requote_s", self.cfg.min_requote_s) if existing.pair_index == 0 else self.cfg.min_requote_s)):
+            queue_reset_cost = getattr(self.cfg, "queue_reset_cost_bps", Decimal("0.20"))
+            ev_gain = getattr(t, "expected_value_bps", Decimal(0)) - getattr(existing, "ev_bps", Decimal(0))
+            if ev_gain >= queue_reset_cost or drift >= (self.cfg.requote_bps * Decimal("1.5")) or abs(t.price - existing.price) >= m.tick:
+                should_modify = True
+
+        if should_modify:
+            if await self.modify(existing, t.price, now, urgent=urgent, reduce_only=is_exit):
+                existing.ev_bps = getattr(t, "expected_value_bps", Decimal(0))
+                existing.quote_mid = getattr(t, "quote_mid", None)
 
     def on_update(self, c, now: float) -> None:
         if not isinstance(c, dict) or not c.get("orderId"):
@@ -378,8 +407,10 @@ class OrderManager:
         if now - self.last_place_ts < 3:
             return
         recent_closed = {oid for ts, oid in self._recently_closed if now - ts < 15.0}
+        reqs = []
         for oid in (open_ids - mine - recent_closed):
             if oid and oid != "None":
                 self._recently_closed.append((now, oid))
                 log.warning("cancelling orphan order %s for market %s (id %d)", oid, m.name, m.market_id)
-                await self.ex.write(self.signer.cancel(m, oid))
+                reqs.append(self.ex.write(self.signer.cancel(m, oid)))
+        await self._gather(reqs)

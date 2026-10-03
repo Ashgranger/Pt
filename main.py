@@ -71,7 +71,11 @@ def main() -> None:
                 signal.signal(sig, lambda *_: loop.call_soon_threadsafe(bot.stop_evt.set))
         await bot.run()
 
-    asyncio.run(_main())
+    try:
+        import uvloop
+        asyncio.run(_main(), loop_factory=uvloop.new_event_loop)
+    except ImportError:
+        asyncio.run(_main())
 
 
 if __name__ == "__main__":

@@ -7,5 +7,7 @@
 - ledger.py: learner state saved at most 1x/sec while live (flushed on stop); tests/library keep immediate save. Weighted-markout memoized per tick.
 - market.py: trade/price window scans iterate newest->oldest and stop early; TFI cached per tick; depth parsed to Decimal once.
 - exchange.py: orjson used if installed. WS permessage-deflate disabled. main.py: uvloop used if installed.
+- DEAD MAN'S SWITCH: Arcus has no cancel-on-disconnect. The invalid `heartbeat` post was replaced by the real `scheduleCancel` (market-scoped, ttl DMS_TTL_S=30, refreshed every <=ttl/3, armed on each (re)connect, signed legacy-scheme). DMS_REQUIRED=1 pauses quoting if it cannot be armed.
+- Shutdown now cancels orders while the socket is still open, verifies empty book, then disarms.
 
 Optional extra speed:  pip install uvloop orjson

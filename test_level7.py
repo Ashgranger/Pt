@@ -863,3 +863,35 @@ class TestLevel7MarketMaker(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDeadMansSwitch(unittest.IsolatedAsyncioTestCase):
+    async def test_34_schedule_cancel_signing_and_refresh(self):
+        """scheduleCancel is signed with legacy scheme (ts+action+canonical body) and refreshed by the bot."""
+        import time as _t
+        from utils import canonical
+        bot, s, clock = sim.make()
+        req = bot.signer.schedule_cancel(sim.MKT, int((_t.time() + 30) * 1e6))
+        self.assertEqual(req["type"], "scheduleCancel")
+        p = req["payload"]
+        self.assertEqual(set(p), {"address", "accountIndex", "marketId", "time"})
+        msg = f"{req['timestamp']}scheduleCancel{canonical(p)}".encode()
+        bot.signer.priv.public_key().verify(bytes.fromhex(req["signature"]), msg)  # raises if wrong
+        self.assertNotIn("time", bot.signer.schedule_cancel(sim.MKT, None)["payload"])  # disarm
+
+        seen = []
+        orig = s._post
+        def spy(m):
+            seen.append(m["request"]["type"])
+            if m["request"]["type"] == "scheduleCancel":
+                s._reply({"id": m["id"], "status": 200, "result": {"status": "scheduled"}})
+            else:
+                orig(m)
+        s._post = spy
+        await bot._heartbeat(clock.t)
+        self.assertIn("scheduleCancel", seen)
+        self.assertTrue(bot._dms_armed)
+        n = len(seen)
+        await bot._heartbeat(clock.t + 1)   # inside refresh interval -> no extra call
+        self.assertEqual(len(seen), n)
+        print("✓ test_34_schedule_cancel passed: signed correctly, armed, refresh throttled.")
