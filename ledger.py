@@ -130,8 +130,8 @@ class OnlineLearner:
             "trend_pull_bps": (Decimal("0.5"), Decimal("10.0")),
             "trend_widen": (Decimal("0.2"), Decimal("4.0")),
             "exit_min_profit_bps": (Decimal("0.5"), Decimal("10.0")),
-            "stress_loss_bps": (min(Decimal("10.0"), self.base["stress_loss_bps"]), max(Decimal("60.0"), self.base["stress_loss_bps"])),
-            "max_hold_s": (min(Decimal("60.0"), self.base["max_hold_s"]), max(Decimal("1200.0"), self.base["max_hold_s"])),
+            "stress_loss_bps": (Decimal("10.0"), Decimal("60.0")),
+            "max_hold_s": (Decimal("60.0"), Decimal("1200.0")),
             "burst_fills": (Decimal("2"), Decimal("5")),
             "burst_cooldown_s": (Decimal("10.0"), Decimal("90.0")),
             "sweep_guard_fills": (Decimal("2"), Decimal("4")),
@@ -761,12 +761,6 @@ class Ledger:
                 self.markouts_5s.append((now, m_bps))
                 self.latest_markout_5s = m_bps
 
-            cb = getattr(self, "on_markout_cb", None)
-            if cb is not None:
-                try:
-                    cb(f, horizon, m_bps)
-                except Exception:
-                    pass
             self.markouts.append((now, m_bps))
             if f.side == BUY:
                 self.markouts_buy.append((now, m_bps))
@@ -781,12 +775,6 @@ class Ledger:
                 self.learner.on_markout(m_bps, f.side, self.tox_bps, horizon=horizon, now=now, regime=regime)
             else:
                 self.learner.markout_model.record(f.side, regime, 0, horizon, float(m_bps))
-
-    @staticmethod
-    def raw_mean_bps(buf) -> Decimal:
-        """Plain mean of the last stored markouts (no 60s decay, so it never reads 0 when idle)."""
-        vals = [(it[1] if isinstance(it, tuple) else it) for it in buf]
-        return (sum(vals, ZERO) / Decimal(len(vals))) if vals else ZERO
 
     @property
     def avg_markout_1s_bps(self) -> Decimal:
