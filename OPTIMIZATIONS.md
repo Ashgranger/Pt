@@ -27,3 +27,5 @@ Optional extra speed:  pip install uvloop orjson
 - Cause: emergency/stress taker IOCs were sent 0.15% (15bps) through the book and the ledger booked the fill at that LIMIT price (the exchange update carried no execution-price field). Every taker fill in the log shows fill px == limit, edge -15..-18bps. That one entry jumped inventory_pnl by about -$0.6 and fed -11bps markouts to the learner (tox_mult up, edge widened, bot stopped quoting).
 - Fix: TAKER_SLIP_BPS (default 4) sets the limit offset; TAKER_FILL_PRICE_MODE=est books the order-book-walk (VWAP) price when the exchange sends no avg price; TAKER_RAW log line dumps the raw update so the true field can be confirmed. Set TAKER_FILL_PRICE_MODE=limit for the old behavior.
 - Test: test_17.
+- Added TAKER_WHY log line (rule, unreal bps, thresholds, hold) whenever a taker exit fires, so the trigger is never a mystery.
+- Verified against exchange history: the 06:11:40 exit really closed at about 234.58 (value $239.39, fee $0.05, closed PnL -$0.08), not at the 234.05 the bot booked (-$0.60).

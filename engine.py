@@ -1,6 +1,8 @@
 """Level 7 Quantitative Market-Making Engine."""
 from __future__ import annotations
 
+import logging
+import time
 import math
 from dataclasses import dataclass
 from decimal import Decimal
@@ -10,6 +12,8 @@ from config import Config
 from market import Market, MarketData
 from ledger import Ledger
 from utils import BPS, BUY, SELL, ZERO, ONE, clamp, q_down, q_up, fmt
+
+log = logging.getLogger("mm")
 
 
 @dataclass
@@ -180,6 +184,15 @@ class MarketMakingEngine:
 
         max_target = min(self.cfg.order_usd * Decimal("0.25"), self.cfg.max_position_usd * Decimal("0.10"))
         return clamp(target_usd, -max_target, max_target)
+
+    def _log_taker_why(self, side, why, unreal_bps, emerg_loss_bps, adv_score, pos_ratio, mid, ledger) -> None:
+        t = time.time()
+        if t - getattr(self, "_last_why_ts", 0.0) < 1.0:
+            return
+        self._last_why_ts = t
+        log.info("TAKER_WHY exit=%s rule=%s unreal=%.2fbps (stress<-%s emerg<-%.2f) adv_score=%.2f pos_ratio=%.2f avg_cost=%s mid=%s hold=%.1fs",
+                 side, why, float(unreal_bps), self.cfg.stress_loss_bps, float(emerg_loss_bps), float(adv_score),
+                 float(pos_ratio), ledger.avg_cost, mid, ledger.hold_s(ledger.last_now or 0) if hasattr(ledger, "hold_s") else 0.0)
 
     def calculate_vwap_cross_cost(self, side: str, qty: Decimal, md: MarketData) -> Tuple[Decimal, Decimal]:
         """Calculates actual VWAP price and crossing cost in bps by walking the L2 book."""
@@ -404,16 +417,23 @@ class MarketMakingEngine:
                     adv_score += (sell_tox / Decimal("5.0"))
 
                     trigger_taker = False
+                    taker_why = ""
                     if self.cfg.enable_smart_inventory_mgmt:
                         if unreal_bps < -self.cfg.stress_loss_bps:
                             trigger_taker = True
+                            taker_why = "stress_loss"
                         elif unreal_bps < -emerg_loss_bps and (has_adverse_flow or adv_score >= self.cfg.emergency_taker_score_threshold):
                             trigger_taker = True
+                            taker_why = "emergency_loss_and_flow"
                         elif pos_ratio >= Decimal("0.80") and unreal_bps < -Decimal("3.0") and has_adverse_flow:
                             trigger_taker = True
+                            taker_why = "pos_ratio_80_adverse_flow"
                         elif ret_5s >= Decimal("3.0") and obi >= Decimal("0.70") and tfi >= Decimal("0.50") and unreal_bps < -self.cfg.taker_fee_bps:
                             trigger_taker = True
+                            taker_why = "trend_cascade"
 
+                    if trigger_taker:
+                        self._log_taker_why("BUY", taker_why, unreal_bps, emerg_loss_bps, adv_score, pos_ratio, mid, ledger)
                     if trigger_taker and md.ask and qty >= m.min_size:
                         vwap, cross_cost = self.calculate_vwap_cross_cost(BUY, qty, md)
                         slip_buffer = max(Decimal("2") * tick, q_up(md.ask * self.cfg.taker_slip_bps / BPS, tick))
@@ -622,16 +642,23 @@ class MarketMakingEngine:
                     adv_score += (buy_tox / Decimal("5.0"))
 
                     trigger_taker = False
+                    taker_why = ""
                     if self.cfg.enable_smart_inventory_mgmt:
                         if unreal_bps < -self.cfg.stress_loss_bps:
                             trigger_taker = True
+                            taker_why = "stress_loss"
                         elif unreal_bps < -emerg_loss_bps and (has_adverse_flow or adv_score >= self.cfg.emergency_taker_score_threshold):
                             trigger_taker = True
+                            taker_why = "emergency_loss_and_flow"
                         elif pos_ratio >= Decimal("0.80") and unreal_bps < -Decimal("3.0") and has_adverse_flow:
                             trigger_taker = True
+                            taker_why = "pos_ratio_80_adverse_flow"
                         elif ret_5s <= -Decimal("3.0") and obi <= Decimal("-0.70") and tfi <= Decimal("-0.50") and unreal_bps < -self.cfg.taker_fee_bps:
                             trigger_taker = True
+                            taker_why = "trend_cascade"
 
+                    if trigger_taker:
+                        self._log_taker_why("SELL", taker_why, unreal_bps, emerg_loss_bps, adv_score, pos_ratio, mid, ledger)
                     if trigger_taker and md.bid and qty >= m.min_size:
                         vwap, cross_cost = self.calculate_vwap_cross_cost(SELL, qty, md)
                         slip_buffer = max(Decimal("2") * tick, q_down(md.bid * self.cfg.taker_slip_bps / BPS, tick))
