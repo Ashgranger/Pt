@@ -338,6 +338,8 @@ class CrossVenueTracker:
                 block_sell = True
                 why.append(f"ext above arcus {wd:+.1f}bps")
         vel = float(self.cross_velocity_bps(1.0, now))
+        if len(self.fresh(now)) < 2:
+            vel_pull_bps *= 1.5      # no second venue to confirm: demand a bigger move
         if vel <= -vel_pull_bps:
             block_buy = True
             why.append(f"ext vel {vel:.1f}bps/1s")

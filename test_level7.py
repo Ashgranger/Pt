@@ -385,6 +385,23 @@ class TestLevel7MarketMaker(unittest.IsolatedAsyncioTestCase):
         self.assertLess(ask_order.price, D("80010.0"), "Ask should be shaded down to breakeven maker under adverse flow")
         print("✓ test_15_smart_inventory_fast_breakeven_unwind passed: Flow-accelerated breakeven unwind active.")
 
+    async def test_17_taker_fill_booked_at_book_price_not_far_limit(self):
+        """Regression: IOC taker exits were booked at their far-through limit (-15..-18bps phantom loss)."""
+        bot, s, clock = sim.make(EXTRA_LEVELS=0, ORDER_USD=20, MAX_POSITION_USD=100,
+                                 EXIT_MIN_PROFIT_BPS="1.5", ENABLE_SMART_INVENTORY_MGMT=1,
+                                 MIN_REQUOTE_S="0.1", EMERGENCY_TAKER_LOSS_BPS="6.0")
+        await sim.step(bot, s, clock, "80000.0", "80080.0")
+        s.taker(SELL)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        clock.t += 0.5
+        s.push_trade(SELL, "2.0", "79900.0")
+        await sim.step(bot, s, clock, "79900.0", "79920.0", bsz="0.1", asz="2.0")
+        f = bot.ledger.fills[-1]
+        self.assertEqual(bot.ledger.position, D(0))
+        self.assertGreaterEqual(f.price, D("79899.0"), "taker must be booked near the touch (bid 79900), not at its limit")
+        self.assertGreater(f.edge_bps, D("-3"))
+
     async def test_16_emergency_taker_cut_on_adverse_cascade(self):
         """Test Emergency Taker Cut: When adverse loss and flow exceed threshold, bot fires IOC taker order to cut loss."""
         bot, s, clock = sim.make(EXTRA_LEVELS=0, ORDER_USD=20, MAX_POSITION_USD=100,
@@ -1068,3 +1085,32 @@ class TestCrossFeedLoop(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(bot.om.get_order_by_slot(0, BUY), "stale bid must be pulled")
         self.assertIsNotNone(bot.om.get_order_by_slot(0, SELL), "ask on the safe side is kept")
         print("✓ test_40 passed: bot pulled the stale bid ahead of Arcus repricing (ask kept).")
+
+
+class TestBybitSubscriptionFix(unittest.IsolatedAsyncioTestCase):
+    async def test_41_bybit_subscribes_separately_and_survives_bad_liquidation_topic(self):
+        sk = _Sink()
+        sent = []
+        class WS:
+            async def send(self, m): sent.append(_json.loads(m))
+        f = _feeds.BybitFeed(sk, "PUMPUSDT", "wss://x")
+        await f.on_open(WS())
+        self.assertEqual(sent[0]["args"], ["orderbook.50.PUMPUSDT", "publicTrade.PUMPUSDT"])
+        self.assertEqual(sent[1]["args"], ["allLiquidation.PUMPUSDT"])   # separate request
+        # exchange rejects the liquidation topic: price feed must NOT be disabled; legacy topic tried once
+        f.handle(_json.dumps({"success": False, "ret_msg": "error:handler not found,topic:allLiquidation.PUMPUSDT", "op": "subscribe"}))
+        self.assertFalse(f.disabled)
+        self.assertEqual(f._resub, ["liquidation.PUMPUSDT"])
+        f.handle(_json.dumps({"success": False, "ret_msg": "error:handler not found,topic:liquidation.PUMPUSDT", "op": "subscribe"}))
+        self.assertFalse(f.disabled)
+        # price data still flows
+        f.handle(_json.dumps({"topic": "orderbook.50.PUMPUSDT", "type": "snapshot", "data": {"u": 3,
+                 "b": [["0.0057", "100"]], "a": [["0.0058", "100"]]}}))
+        self.assertEqual(len(sk.bbo), 1)
+        # new allLiquidation payload (S=Buy => long liquidated => forced SELL)
+        f.handle(_json.dumps({"topic": "allLiquidation.PUMPUSDT", "data": [{"T": 1, "s": "PUMPUSDT", "S": "Buy", "v": "1000", "p": "0.0057"}]}))
+        self.assertEqual(sk.liqs[-1][1], "SELL")
+        # a bad ORDERBOOK subscription (symbol not listed) disables the feed instead of reconnect-looping
+        f.handle(_json.dumps({"success": False, "ret_msg": "error:handler not found,topic:orderbook.50.PUMPUSDT", "op": "subscribe"}))
+        self.assertTrue(f.disabled)
+        print("✓ test_41 passed: Bybit liquidation rejection no longer kills the price feed.")

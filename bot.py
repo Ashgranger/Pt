@@ -41,6 +41,39 @@ def extract_positions(c: Any) -> list:
     return []
 
 
+from datetime import datetime as _dt
+try:
+    from zoneinfo import ZoneInfo as _ZI
+    _ET = _ZI("America/New_York")
+except Exception:  # pragma: no cover
+    _ET = None
+
+
+def et_hhmmss(ts: float) -> str:
+    """US Eastern wall-clock for a unix timestamp (handles EST/EDT)."""
+    try:
+        return _dt.fromtimestamp(ts, _ET).strftime("%H:%M:%S") if _ET else ""
+    except Exception:
+        return ""
+
+
+def in_et_windows(spec: str, ts: float) -> bool:
+    """spec like '09:30-09:50,15:50-16:00' (ET). Empty = never."""
+    if not spec or not _ET:
+        return False
+    cur = _dt.fromtimestamp(ts, _ET)
+    mins = cur.hour * 60 + cur.minute
+    for part in spec.split(","):
+        try:
+            a, z = part.strip().split("-")
+            ah, am = a.split(":"); zh, zm = z.split(":")
+            if int(ah) * 60 + int(am) <= mins < int(zh) * 60 + int(zm):
+                return True
+        except Exception:
+            continue
+    return False
+
+
 class MarketMaker:
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -51,6 +84,7 @@ class MarketMaker:
         self.md = MarketData(cfg)
         self.signer = Signer(cfg.signing_key, cfg.address, cfg.account_index)
         self.ledger = Ledger(cfg)
+        self.ledger.on_markout_cb = self._journal_markout
         self.engine = MarketMakingEngine(cfg)
         self.om = OrderManager(cfg, self.ex, self.signer, self._get_market, self._on_fill)
 
@@ -205,9 +239,18 @@ class MarketMaker:
         is_maker = not getattr(o, "is_taker", False)
         fill = self.ledger.on_fill(side, qty, price, mid, now, min_notional, is_maker=is_maker)
         current_mid = self.md.mid or price
-        log.info("FILL L%d %s %s @ %s | edge=%sbps pos=%s pnl=$%s",
+        log.info("FILL L%d %s %s @ %s | edge=%sbps pos=%s pnl=$%s ET=%s",
                  o.pair_index, side, fmt(qty), fmt(price), fmt(fill.edge_bps),
-                 fmt(self.ledger.position), fmt(self.ledger.total_pnl(current_mid)))
+                 fmt(self.ledger.position), fmt(self.ledger.total_pnl(current_mid)),
+                 et_hhmmss(time.time()))
+        try:
+            self._fill_ctx = {
+                "level": o.pair_index, "et": et_hhmmss(time.time()),
+                "obi": float(self.md.obi), "tfi": float(self.md.trade_flow_imbalance(10.0, now)),
+                "spr_bps": float(self.md.spread_bps), "taker": bool(getattr(o, "is_taker", False)),
+            }
+        except Exception:
+            self._fill_ctx = {"level": o.pair_index, "et": et_hhmmss(time.time())}
 
         self._recent_fills.append((now, side))
         while self._recent_fills and now - self._recent_fills[0][0] > self.cfg.burst_window_s:
@@ -267,8 +310,20 @@ class MarketMaker:
             "realized_delta": fmt(f.realized_delta), "total_realized": fmt(self.ledger.realized),
             "fees": fmt(self.ledger.fees)
         }
+        row.update(getattr(self, "_fill_ctx", None) or {})
         try:
             self._fp(self.cfg.journal_path).write(json.dumps(row) + "\n")
+        except Exception:
+            pass
+
+    def _journal_markout(self, f: Fill, horizon: float, m_bps) -> None:
+        """Per-fill markout rows (join to fills on fill_ts) for offline conditional-EV fitting."""
+        if not self.cfg.journal_path or self.cfg.journal_path == os.devnull:
+            return
+        try:
+            self._fp(self.cfg.journal_path).write(json.dumps({
+                "type": "markout", "fill_ts": f.ts, "side": f.side,
+                "h": horizon, "markout_bps": round(float(m_bps), 4)}) + "\n")
         except Exception:
             pass
 
@@ -415,6 +470,13 @@ class MarketMaker:
                 if pos_usd <= 0:
                     sell_blocked = True
 
+            if in_et_windows(self.cfg.et_pause_windows, time.time()):
+                # ET blackout (e.g. US open): stop ADDING, never block unwinds
+                if pos_usd >= 0:
+                    buy_blocked = True
+                if pos_usd <= 0:
+                    sell_blocked = True
+
             existing_slots = set(self.om.pair_slots.keys())
             targets = self.engine.generate_ladder_quotes(
                 m, self.md, self.ledger, now, buy_blocked, sell_blocked, existing_slots=existing_slots
@@ -539,9 +601,9 @@ class MarketMaker:
             inv_pnl = self.ledger.inventory_pnl(mid)
             reason = s.get("last_change_reason", "none") or "none"
 
-            m1s = (f"{float(self.ledger.avg_markout_1s_bps):+.2f}bps") if self.ledger.markouts_1s else "0.00bps"
-            m5s = (f"{float(self.ledger.avg_markout_5s_bps):+.2f}bps") if self.ledger.markouts_5s else "0.00bps"
-            m_avg = (f"{float(self.ledger.avg_markout_bps):+.2f}bps") if self.ledger.markouts else "0.00bps"
+            m1s = (f"{float(Ledger.raw_mean_bps(self.ledger.markouts_1s)):+.2f}bps") if self.ledger.markouts_1s else "0.00bps"
+            m5s = (f"{float(Ledger.raw_mean_bps(self.ledger.markouts_5s)):+.2f}bps") if self.ledger.markouts_5s else "0.00bps"
+            m_avg = (f"{float(Ledger.raw_mean_bps(self.ledger.markouts)):+.2f}bps") if self.ledger.markouts else "0.00bps"
             wr = f"{s['win_rate']:.1f}%"
             afr = f"{s['adverse_fill_rate']:.1f}%"
             pnl_delta = ("+$" if realized_delta >= 0 else "-$") + f"{abs(float(realized_delta)):.2f}"

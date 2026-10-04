@@ -40,7 +40,7 @@ def derive_symbol(market: str, override: str = "") -> str:
 
 class VenueFeed:
     name = "VENUE"
-    idle_timeout_s = 10.0
+    idle_timeout_s = 15.0
 
     def __init__(self, sink: Any, symbol: str, url: str, connect: Optional[Callable] = None):
         self.sink = sink
@@ -50,6 +50,7 @@ class VenueFeed:
         self.msgs = 0
         self.connected = False
         self._stop = False
+        self.disabled = False      # set when the venue permanently rejects our symbol
 
     # -- to override ------------------------------------------------------ #
     def full_url(self) -> str:
@@ -84,7 +85,7 @@ class VenueFeed:
                     self.msgs = 0
                     await self.on_open(ws)
                     ka = asyncio.create_task(self.keepalive(ws))
-                    while not self._stop:
+                    while not self._stop and not self.disabled:
                         try:
                             raw = await asyncio.wait_for(ws.recv(), timeout=self.idle_timeout_s)
                         except asyncio.TimeoutError:
@@ -108,6 +109,10 @@ class VenueFeed:
                     self.sink.on_external_disconnect(self.name)
             if self._stop:
                 break
+            if self.disabled:
+                log.error("[%s] feed DISABLED (symbol %s not accepted by the venue) - continuing without it",
+                          self.name, self.symbol)
+                return
             log.info("[%s] reconnecting in %.1fs", self.name, delay)
             await asyncio.sleep(delay)
             delay = min(delay * 2, 15.0)
@@ -154,19 +159,31 @@ class BybitFeed(VenueFeed):
         super().__init__(*a, **k)
         self._bids: dict = {}
         self._asks: dict = {}
+        self._resub: list = []
+        self._liq_topic_tried: set = {"allLiquidation"}
 
     async def on_open(self, ws) -> None:
         self._bids.clear()
         self._asks.clear()
+        self._resub = []
+        self._liq_topic_tried = {"allLiquidation"}
         sym = self.symbol
-        await ws.send(json.dumps({"op": "subscribe", "args": [
-            f"orderbook.50.{sym}", f"publicTrade.{sym}", f"liquidation.{sym}"]}))
+        # Core data and liquidations are subscribed SEPARATELY: Bybit rejects a whole
+        # subscribe request if any one topic is invalid, which previously starved the feed.
+        await ws.send(json.dumps({"op": "subscribe", "args": [f"orderbook.50.{sym}", f"publicTrade.{sym}"]}))
+        await ws.send(json.dumps({"op": "subscribe", "args": [f"allLiquidation.{sym}"]}))
 
     async def keepalive(self, ws) -> None:
         try:
+            last_ping = 0.0
+            loop = asyncio.get_running_loop()
             while True:
-                await asyncio.sleep(20)
-                await ws.send(json.dumps({"op": "ping"}))
+                await asyncio.sleep(1.0)
+                while self._resub:
+                    await ws.send(json.dumps({"op": "subscribe", "args": [self._resub.pop(0)]}))
+                if loop.time() - last_ping >= 20.0:
+                    last_ping = loop.time()
+                    await ws.send(json.dumps({"op": "ping"}))
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -184,7 +201,18 @@ class BybitFeed(VenueFeed):
         msg = _loads(raw)
         if "topic" not in msg:
             if msg.get("success") is False:
-                log.error("[BYBIT] subscribe failed: %s (check BYBIT_SYMBOL=%s)", msg.get("ret_msg"), self.symbol)
+                ret = str(msg.get("ret_msg"))
+                if "iquidation" in ret:
+                    # liquidation feed is optional: try the legacy topic once, never affect price data
+                    if "liquidation" not in self._liq_topic_tried:
+                        self._liq_topic_tried.add("liquidation")
+                        self._resub.append(f"liquidation.{self.symbol}")
+                        log.warning("[BYBIT] allLiquidation rejected (%s) - trying legacy liquidation topic", ret)
+                    else:
+                        log.warning("[BYBIT] liquidation stream unavailable (%s) - running without it", ret)
+                else:
+                    log.error("[BYBIT] subscribe failed: %s (check BYBIT_SYMBOL=%s)", ret, self.symbol)
+                    self.disabled = True
             return
         topic = msg["topic"]
         data = msg["data"]
@@ -207,12 +235,15 @@ class BybitFeed(VenueFeed):
         elif topic.startswith("publicTrade."):
             for t in data:
                 self.sink.on_external_trade(self.name, str(t["S"]).upper(), D(t["v"]), D(t["p"]))
-        elif topic.startswith("liquidation."):
+        elif topic.startswith(("allLiquidation.", "liquidation.")):
             rows = data if isinstance(data, list) else [data]
             for t in rows:
-                # Bybit 'side' = side of the POSITION liquidated (Buy = long) -> forced order is the opposite
-                forced = "SELL" if str(t["side"]).lower() == "buy" else "BUY"
-                self.sink.on_external_liq(self.name, forced, D(t["size"]), D(t["price"]))
+                # Bybit side = side of the POSITION liquidated (Buy = long) -> forced order is the opposite
+                side = t.get("S") or t.get("side")
+                size = t.get("v") or t.get("size")
+                price = t.get("p") or t.get("price")
+                forced = "SELL" if str(side).lower() == "buy" else "BUY"
+                self.sink.on_external_liq(self.name, forced, D(size), D(price))
 
 
 # ---------------------------------------------------------------------------- #

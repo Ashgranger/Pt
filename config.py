@@ -142,6 +142,8 @@ class Config:
     # --- Inventory Risk Management & Taker Loss Cut ------------------------ #
     enable_smart_inventory_mgmt: bool
     taker_fee_bps: Decimal
+    taker_slip_bps: Decimal
+    taker_fill_price_mode: str
     emergency_taker_loss_bps: Decimal
     emergency_taker_score_threshold: Decimal
 
@@ -157,6 +159,7 @@ class Config:
     queue_reset_cost_bps: Decimal
     enable_absorption_mode: bool
     enable_onesided_touch: bool
+    et_pause_windows: str
     enable_quote_dataset: bool
     quote_dataset_path: str
     enable_empirical_learner: bool
@@ -283,6 +286,8 @@ class Config:
             markout_horizons_s=str(_e("MARKOUT_HORIZONS_S", "1,5,30")),
             enable_smart_inventory_mgmt=_b("ENABLE_SMART_INVENTORY_MGMT", "1"),
             taker_fee_bps=_d("TAKER_FEE_BPS", "2.2"),
+            taker_slip_bps=_d("TAKER_SLIP_BPS", "4"),
+            taker_fill_price_mode=str(_e("TAKER_FILL_PRICE_MODE", "est")).lower(),
             emergency_taker_loss_bps=_d("EMERGENCY_TAKER_LOSS_BPS", "6.0"),
             emergency_taker_score_threshold=_d("EMERGENCY_TAKER_SCORE_THRESHOLD", "2.5"),
             enable_selective_touch=_b("ENABLE_SELECTIVE_TOUCH", "1"),
@@ -296,6 +301,7 @@ class Config:
             queue_reset_cost_bps=_d("QUEUE_RESET_COST_BPS", "0.20"),
             enable_absorption_mode=_b("ENABLE_ABSORPTION_MODE", "1"),
             enable_onesided_touch=_b("ENABLE_ONESIDED_TOUCH", "1"),
+            et_pause_windows=str(_e("ET_PAUSE_WINDOWS", "")),
             enable_quote_dataset=_b("ENABLE_QUOTE_DATASET", "1"),
             quote_dataset_path=str(_e("QUOTE_DATASET_PATH", f"quotes_{'paper' if dry else 'live'}_{market}.jsonl")),
             enable_empirical_learner=_b("ENABLE_EMPIRICAL_LEARNER", "1"),
