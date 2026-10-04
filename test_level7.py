@@ -402,6 +402,84 @@ class TestLevel7MarketMaker(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(f.price, D("79899.0"), "taker must be booked near the touch (bid 79900), not at its limit")
         self.assertGreater(f.edge_bps, D("-3"))
 
+    async def test_18_adverse_obi_persist_exit(self):
+        """Book leaning against an open long for a few seconds + small loss -> early taker exit, only when enabled."""
+        async def run(enabled):
+            bot, s, clock = sim.make(EXTRA_LEVELS=0, ORDER_USD=20, MAX_POSITION_USD=100,
+                                     EXIT_MIN_PROFIT_BPS="1.5", ENABLE_SMART_INVENTORY_MGMT=1,
+                                     MIN_REQUOTE_S="0.1", STRESS_LOSS_BPS="50", EMERGENCY_TAKER_LOSS_BPS="50",
+                                     ADV_OBI_EXIT=enabled, ADV_OBI_SECS="3", ADV_OBI_LOSS_BPS="2.0")
+            await sim.step(bot, s, clock, "80000.0", "80080.0")
+            s.taker(SELL)
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            for _ in range(8):
+                await sim.step(bot, s, clock, "79970.0", "79990.0", bsz="0.1", asz="5.0", dt=1.0)
+            return bot.ledger.position
+        self.assertEqual(await run("1"), D(0), "persistent adverse book + loss must flatten via taker")
+        self.assertNotEqual(await run("0"), D(0), "rule is off by default")
+
+    async def test_19_daily_loss_pause_keeps_running_and_unwinds(self):
+        """SESSION_LOSS_ACTION=pause_day: breach must NOT stop the bot, only block new adds."""
+        bot, s, clock = sim.make(EXTRA_LEVELS=0, ORDER_USD=20, MAX_POSITION_USD=100,
+                                 SESSION_MAX_LOSS_USD="0.001", SESSION_LOSS_ACTION="pause_day",
+                                 ENABLE_SMART_INVENTORY_MGMT=1, MIN_REQUOTE_S="0.1")
+        await sim.step(bot, s, clock, "80000.0", "80080.0")
+        s.taker(SELL)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        for _ in range(6):
+            await sim.step(bot, s, clock, "79900.0", "79920.0", bsz="0.1", asz="2.0", dt=1.0)
+        self.assertFalse(bot.stop_evt.is_set(), "pause_day must not halt the process")
+        self.assertGreater(bot._loss_pause_until, 0.0)
+        # default behavior unchanged
+        bot2, s2, clock2 = sim.make(SESSION_MAX_LOSS_USD="0.001", ORDER_USD=20, MAX_POSITION_USD=100)
+        await sim.step(bot2, s2, clock2, "80000.0", "80080.0")
+        s2.taker(SELL)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        for _ in range(6):
+            await sim.step(bot2, s2, clock2, "79900.0", "79920.0", bsz="0.1", asz="2.0", dt=1.0)
+        self.assertTrue(bot2.stop_evt.is_set(), "default 'halt' still stops")
+
+    async def test_20_exclude_own_orders_from_book_metrics(self):
+        from market import MarketData
+        def mk(flag):
+            bot, s, clock = sim.make(EXCLUDE_OWN_ORDERS=flag)
+            md = MarketData(bot.cfg)
+            md.update(D("100.00"), D("100.02"), D("3"), D("1"), 1.0)
+            md.on_depth([["100.00", "3"], ["99.98", "5"]], [["100.02", "1"], ["100.04", "2"]], 1.0)
+            md.own_provider = lambda: [(BUY, D("100.00"), D("2"))]
+            return md
+        off, on = mk("0"), mk("1")
+        self.assertEqual(off.obi, D("0.5"))                  # (3-1)/(3+1): unchanged when switch is off
+        self.assertEqual(on.obi, D("0"))                     # (1-1)/(1+1): our 2 removed
+        self.assertEqual(on.top_size("BUY"), D("1"))
+        self.assertEqual(on.raw_obi, D("0.5"))
+        self.assertLess(on.micro, off.micro)                 # no longer pulled up by our own bid
+        self.assertEqual(on.queue_ahead(BUY, D("100.00")), D("1"))
+        self.assertEqual(off.queue_ahead(BUY, D("100.00")), D("3"))
+        # our order alone at the touch -> next external level used, never negative / zero-division
+        on.own_provider = lambda: [(BUY, D("100.00"), D("3"))]
+        self.assertEqual(on.top_size("BUY"), D("5"))
+        self.assertGreaterEqual(on.multi_depth_obi(5), D("-1"))
+        # unwinding/just-placed orders are not counted: provider is the filter (see bot._own_resting)
+        on.own_provider = lambda: []
+        self.assertEqual(on.obi, D("0.5"))
+
+    async def test_21_own_resting_filters_young_and_cancelling_and_taker(self):
+        bot, s, clock = sim.make(EXCLUDE_OWN_ORDERS="1", OWN_ORDER_MIN_AGE_S="0.3")
+        from orders import Order
+        now = bot.now()
+        mkd = lambda oid, created, **kw: Order(order_id=oid, pair_index=0, side=BUY, price=D("100"), qty=D("1"),
+                                               remaining=D("1"), good_til_us=0, created=created, last_action=created, **kw)
+        bot.om.orders.clear()
+        bot.om.orders["a"] = mkd("a", now - 5)
+        bot.om.orders["young"] = mkd("young", now - 0.05)
+        bot.om.orders["cx"] = mkd("cx", now - 5, cancelling_since=now - 1)
+        bot.om.orders["tk"] = mkd("tk", now - 5, is_taker=True)
+        self.assertEqual(len(bot._own_resting()), 1)
+
     async def test_16_emergency_taker_cut_on_adverse_cascade(self):
         """Test Emergency Taker Cut: When adverse loss and flow exceed threshold, bot fires IOC taker order to cut loss."""
         bot, s, clock = sim.make(EXTRA_LEVELS=0, ORDER_USD=20, MAX_POSITION_USD=100,

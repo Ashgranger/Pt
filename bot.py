@@ -85,6 +85,9 @@ class MarketMaker:
         self.signer = Signer(cfg.signing_key, cfg.address, cfg.account_index)
         self.ledger = Ledger(cfg)
         self.ledger.on_markout_cb = self._journal_markout
+        self.md.own_provider = self._own_resting
+        self._loss_pause_until = 0.0
+        self._pnl_base = ZERO
         self.engine = MarketMakingEngine(cfg)
         self.om = OrderManager(cfg, self.ex, self.signer, self._get_market, self._on_fill)
 
@@ -316,6 +319,13 @@ class MarketMaker:
         except Exception:
             pass
 
+    def _own_resting(self):
+        """Our RESTING maker orders old enough to be on the book and not being cancelled."""
+        now = self.now()
+        age = self.cfg.own_order_min_age_s
+        return [(o.side, o.price, o.remaining) for o in self.om.orders.values()
+                if not o.is_taker and o.cancelling_since is None and o.remaining > 0 and (now - o.created) >= age]
+
     def _journal_markout(self, f: Fill, horizon: float, m_bps) -> None:
         """Per-fill markout rows (join to fills on fill_ts) for offline conditional-EV fitting."""
         if not self.cfg.journal_path or self.cfg.journal_path == os.devnull:
@@ -332,7 +342,15 @@ class MarketMaker:
             return
         if self.cfg.quote_dataset_path == os.devnull:
             return
+        if now - getattr(self, "_last_ds_ts", -1e9) < self.cfg.quote_dataset_min_s:
+            return
+        self._last_ds_ts = now
         try:
+            fp0 = self._fp(self.cfg.quote_dataset_path)
+            if self.cfg.quote_dataset_max_mb > 0 and fp0.tell() > self.cfg.quote_dataset_max_mb * 1024 * 1024:
+                fp0.close()
+                self._files.pop(self.cfg.quote_dataset_path, None)
+                os.replace(self.cfg.quote_dataset_path, self.cfg.quote_dataset_path + ".1")  # keep one old chunk
             snapshot = self.md.get_microstructure_snapshot(self.md.info, now)
             record = {
                 "ts": now,
@@ -385,7 +403,18 @@ class MarketMaker:
                 return
 
             tot_pnl = self.ledger.total_pnl(mid)
-            if tot_pnl <= -self.cfg.session_max_loss_usd:
+            if self.cfg.session_loss_action == "pause_day":
+                wall = time.time()
+                until = getattr(self, "_loss_pause_until", 0.0)
+                if until and wall >= until:                       # new UTC day: fresh loss budget
+                    self._loss_pause_until = 0.0
+                    self._pnl_base = tot_pnl
+                    log.warning("Daily loss pause over - resuming quoting with a fresh loss budget")
+                if not self._loss_pause_until and (tot_pnl - getattr(self, "_pnl_base", ZERO)) <= -self.cfg.session_max_loss_usd:
+                    self._loss_pause_until = (int(wall // 86400) + 1) * 86400.0
+                    log.error("DAILY LOSS LIMIT HIT ($%s from day start, limit -$%s) - no new adds until 00:00 UTC; unwinds continue",
+                              fmt(tot_pnl - getattr(self, "_pnl_base", ZERO)), fmt(self.cfg.session_max_loss_usd))
+            elif tot_pnl <= -self.cfg.session_max_loss_usd:
                 log.error("SESSION MAX LOSS BREACHED ($%s <= -$%s) - HALTING",
                           fmt(tot_pnl), fmt(self.cfg.session_max_loss_usd))
                 await self.om.cancel_all(force=True)
@@ -470,7 +499,7 @@ class MarketMaker:
                 if pos_usd <= 0:
                     sell_blocked = True
 
-            if in_et_windows(self.cfg.et_pause_windows, time.time()):
+            if getattr(self, "_loss_pause_until", 0.0) or in_et_windows(self.cfg.et_pause_windows, time.time()):
                 # ET blackout (e.g. US open): stop ADDING, never block unwinds
                 if pos_usd >= 0:
                     buy_blocked = True

@@ -380,6 +380,77 @@ class MarketData:
         self.cross = CrossVenueTracker(cfg)
         self.funding_rate: Decimal = ZERO
         self.next_funding_time: float = 0.0
+        # Own-order exclusion: provider returns [(side, price, remaining_qty)] of our RESTING maker orders.
+        self.own_provider = None
+
+    # ---------------- own-order exclusion ----------------
+    @property
+    def _excl(self) -> bool:
+        return bool(getattr(self.cfg, "exclude_own_orders", False)) and self.own_provider is not None
+
+    def _own_at(self, side: str, price: Decimal) -> Decimal:
+        if not self._excl:
+            return ZERO
+        tot = ZERO
+        try:
+            for s, p, q in self.own_provider():
+                if s == side and p == price:
+                    tot += q
+        except Exception:
+            return ZERO
+        return tot
+
+    def _own_levels(self, side: str) -> dict:
+        d: dict = {}
+        if not self._excl:
+            return d
+        try:
+            for s, p, q in self.own_provider():
+                if s == side:
+                    d[p] = d.get(p, ZERO) + q
+        except Exception:
+            return {}
+        return d
+
+    def depth_levels(self, side: str) -> list:
+        """Book levels for BUY/BID (bids) or SELL/ASK (asks) with our own resting size removed (clamped at 0)."""
+        is_bid = side in ("BUY", "BID")
+        raw = self._book_depth_bids if is_bid else self._book_depth_asks
+        own = self._own_levels("BUY" if is_bid else "SELL")
+        if not own:
+            return raw
+        out = []
+        for row in raw:
+            p, sz = _D(row[0]), _D(row[1])
+            e = sz - own.get(p, ZERO)
+            if e > ZERO:
+                out.append((p, e))
+        return out
+
+    def top_size(self, side: str) -> Optional[Decimal]:
+        """Touch size excluding own orders. If our order is alone at the touch, use the next external level."""
+        is_bid = side in ("BUY", "BID")
+        raw = self.bid_sz if is_bid else self.ask_sz
+        px = self.bid if is_bid else self.ask
+        if raw is None or px is None or not self._excl:
+            return raw
+        own = self._own_at("BUY" if is_bid else "SELL", px)
+        if own <= ZERO:
+            return raw
+        ext = raw - own
+        if ext > ZERO:
+            return ext
+        for p, sz in self.depth_levels(side):
+            if (is_bid and p < px) or ((not is_bid) and p > px):
+                return sz
+        return ZERO
+
+    @property
+    def raw_obi(self) -> Decimal:
+        if self.bid_sz is None or self.ask_sz is None:
+            return ZERO
+        t = self.bid_sz + self.ask_sz
+        return (self.bid_sz - self.ask_sz) / t if t > 0 else ZERO
 
     def clear_book(self) -> None:
         self.bid = self.ask = self.bid_sz = self.ask_sz = None
@@ -441,18 +512,20 @@ class MarketData:
     def micro(self) -> Optional[Decimal]:
         if self.bid is None or self.ask is None:
             return None
-        if self.bid_sz and self.ask_sz and (self.bid_sz + self.ask_sz) > 0:
-            return (self.bid * self.ask_sz + self.ask * self.bid_sz) / (self.bid_sz + self.ask_sz)
+        bsz, asz = self.top_size("BUY"), self.top_size("SELL")
+        if bsz and asz and (bsz + asz) > 0:
+            return (self.bid * asz + self.ask * bsz) / (bsz + asz)
         return self.mid
 
     @property
     def obi(self) -> Decimal:
-        if self.bid_sz is None or self.ask_sz is None:
+        bsz, asz = self.top_size("BUY"), self.top_size("SELL")
+        if bsz is None or asz is None:
             return ZERO
-        total = self.bid_sz + self.ask_sz
+        total = bsz + asz
         if total <= 0:
             return ZERO
-        return (self.bid_sz - self.ask_sz) / total
+        return (bsz - asz) / total
 
     def trade_flow_imbalance(self, window_s: float, now: float) -> Decimal:
         if self._tfi_now != now:
@@ -541,26 +614,26 @@ class MarketData:
         """Calculates resting queue depth ahead of (and at) our quote price on the given side."""
         if side in ("BUY", "BID"):
             if not self._book_depth_bids:
-                return self.bid_sz or Decimal("1")
+                return self.top_size("BUY") or Decimal("1")
             ahead = ZERO
-            for row in self._book_depth_bids:
+            for row in self.depth_levels("BUY"):
                 p, sz = _D(row[0]), _D(row[1])
                 if p >= price:
                     ahead += sz
                 else:
                     break
-            return ahead if ahead > ZERO else (self.bid_sz or Decimal("1"))
+            return ahead if ahead > ZERO else (self.top_size("BUY") or Decimal("1"))
         else:
             if not self._book_depth_asks:
-                return self.ask_sz or Decimal("1")
+                return self.top_size("SELL") or Decimal("1")
             ahead = ZERO
-            for row in self._book_depth_asks:
+            for row in self.depth_levels("SELL"):
                 p, sz = _D(row[0]), _D(row[1])
                 if p <= price:
                     ahead += sz
                 else:
                     break
-            return ahead if ahead > ZERO else (self.ask_sz or Decimal("1"))
+            return ahead if ahead > ZERO else (self.top_size("SELL") or Decimal("1"))
 
     def consumption_rate(self, side: str, window_s: float, now: float) -> Decimal:
         """Aggressive trade volume hitting the given book side per second."""
@@ -577,18 +650,18 @@ class MarketData:
         """Ratio of aggressive counter-flow volume (1s) to available resting depth (L1-L5).
         A fragility value > 0.5 indicates resting liquidity is being consumed rapidly (imminent level sweep)."""
         cons = self.consumption_rate(side, 1.0, now)
-        depth_list = self._book_depth_bids[:5] if side in ("BUY", "BID") else self._book_depth_asks[:5]
+        depth_list = self.depth_levels(side)[:5]
         depth = sum(_D(r[1]) for r in depth_list) if depth_list else ZERO
         if depth <= ZERO:
-            depth = (self.bid_sz if side in ("BUY", "BID") else self.ask_sz) or Decimal("1")
+            depth = self.top_size(side) or Decimal("1")
         return cons / max(Decimal("0.01"), depth)
 
     def multi_depth_obi(self, levels: int = 5) -> Decimal:
         """Volume-weighted order book imbalance across the top N book levels."""
         if not self._book_depth_bids or not self._book_depth_asks:
             return self.obi
-        bid_v = sum(_D(r[1]) for r in self._book_depth_bids[:levels])
-        ask_v = sum(_D(r[1]) for r in self._book_depth_asks[:levels])
+        bid_v = sum(_D(r[1]) for r in self.depth_levels("BUY")[:levels])
+        ask_v = sum(_D(r[1]) for r in self.depth_levels("SELL")[:levels])
         tot = bid_v + ask_v
         if tot <= ZERO:
             return ZERO
@@ -654,7 +727,7 @@ class MarketData:
         return (self.micro - self.mid) / self.mid * BPS
 
     def depth_concentration(self, side: str, levels: int = 5) -> Decimal:
-        depth_list = self._book_depth_bids[:levels] if side in ("BUY", "BID") else self._book_depth_asks[:levels]
+        depth_list = self.depth_levels(side)[:levels]
         if not depth_list:
             return Decimal("1.0")
         l0_sz = _D(depth_list[0][1])
@@ -674,6 +747,9 @@ class MarketData:
             "micro": str(self.micro or "0"),
             "micro_spread_bps": float(self.micro_spread_bps()),
             "obi_l1": float(self.obi),
+            "obi_l1_raw": float(self.raw_obi),
+            "own_bid_at_touch": float(self._own_at("BUY", self.bid)) if self.bid is not None else 0.0,
+            "own_ask_at_touch": float(self._own_at("SELL", self.ask)) if self.ask is not None else 0.0,
             "obi_l5": float(self.multi_depth_obi(5)),
             "obi_l10": float(self.multi_depth_obi(10)),
             "tfi_250ms": float(self.tfi_horizon(0.25, now)),

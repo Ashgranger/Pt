@@ -143,6 +143,15 @@ class Config:
     enable_smart_inventory_mgmt: bool
     taker_fee_bps: Decimal
     taker_slip_bps: Decimal
+    adv_obi_exit: bool
+    exclude_own_orders: bool
+    own_order_min_age_s: float
+    session_loss_action: str
+    quote_dataset_min_s: float
+    quote_dataset_max_mb: float
+    adv_obi_thresh: Decimal
+    adv_obi_secs: float
+    adv_obi_loss_bps: Decimal
     taker_fill_price_mode: str
     emergency_taker_loss_bps: Decimal
     emergency_taker_score_threshold: Decimal
@@ -287,6 +296,15 @@ class Config:
             enable_smart_inventory_mgmt=_b("ENABLE_SMART_INVENTORY_MGMT", "1"),
             taker_fee_bps=_d("TAKER_FEE_BPS", "2.2"),
             taker_slip_bps=_d("TAKER_SLIP_BPS", "4"),
+            adv_obi_exit=_b("ADV_OBI_EXIT", "0"),
+            exclude_own_orders=_b("EXCLUDE_OWN_ORDERS", "0"),
+            own_order_min_age_s=float(_e("OWN_ORDER_MIN_AGE_S", "0.3")),
+            session_loss_action=str(_e("SESSION_LOSS_ACTION", "halt")).lower(),
+            quote_dataset_min_s=float(_e("QUOTE_DATASET_MIN_S", "1.0")),
+            quote_dataset_max_mb=float(_e("QUOTE_DATASET_MAX_MB", "200")),
+            adv_obi_thresh=_d("ADV_OBI_THRESH", "0.85"),
+            adv_obi_secs=float(_e("ADV_OBI_SECS", "5")),
+            adv_obi_loss_bps=_d("ADV_OBI_LOSS_BPS", "2.0"),
             taker_fill_price_mode=str(_e("TAKER_FILL_PRICE_MODE", "est")).lower(),
             emergency_taker_loss_bps=_d("EMERGENCY_TAKER_LOSS_BPS", "6.0"),
             emergency_taker_score_threshold=_d("EMERGENCY_TAKER_SCORE_THRESHOLD", "2.5"),

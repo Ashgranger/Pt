@@ -53,8 +53,19 @@ def bps_diff(a: Decimal, b: Decimal) -> Decimal:
 
 
 def setup_logging(level: str = "INFO") -> None:
+    """Dated timestamps (multi-day runs) + optional size-rotated file via LOG_FILE / LOG_MAX_MB / LOG_BACKUPS."""
+    import os
+    from logging.handlers import RotatingFileHandler
+    handlers = [logging.StreamHandler()]
+    path = os.getenv("LOG_FILE", "").strip()
+    if path:
+        mb = float(os.getenv("LOG_MAX_MB", "20"))
+        handlers.append(RotatingFileHandler(path, maxBytes=int(mb * 1024 * 1024),
+                                            backupCount=int(os.getenv("LOG_BACKUPS", "10")), encoding="utf-8"))
     logging.basicConfig(
         level=level,
         format="%(asctime)s %(levelname)-7s %(message)s",
-        datefmt="%H:%M:%S"
+        datefmt="%m-%d %H:%M:%S",
+        handlers=handlers,
+        force=True,
     )

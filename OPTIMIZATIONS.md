@@ -29,3 +29,19 @@ Optional extra speed:  pip install uvloop orjson
 - Test: test_17.
 - Added TAKER_WHY log line (rule, unreal bps, thresholds, hold) whenever a taker exit fires, so the trigger is never a mystery.
 - Verified against exchange history: the 06:11:40 exit really closed at about 234.58 (value $239.39, fee $0.05, closed PnL -$0.08), not at the 234.05 the bot booked (-$0.60).
+
+## Adverse-OBI exit (from the 09:56 short)
+- Cause of the session loss: L0+L1 both sold in one second (3.2 sh, $755) at 09:56:37 as the market flipped quiet->trend; book then sat 0.9+ bid-heavy for 100s while the passive buy exit waited; one 13c gap hit the 6bps stop (-$0.5 total).
+- ADV_OBI_EXIT=1: taker exit when obi leans against the position >= ADV_OBI_THRESH for ADV_OBI_SECS and unreal < -ADV_OBI_LOSS_BPS. Default off. Based on ONE event - validate with TAKER_WHY logs.
+
+## Multi-day run hardening
+- Logs now carry the date (MM-DD HH:MM:SS); LOG_FILE enables size-rotated file logging.
+- Quote dataset throttled to 1 write/s and capped (rotates to .1 at QUOTE_DATASET_MAX_MB).
+- SESSION_LOSS_ACTION=pause_day: the old default HALTs and cancels orders but leaves any open position unmanaged (HALT_EXIT is declared but never used). pause_day keeps unwinding, blocks adds until 00:00 UTC, then resets the budget.
+- run_forever.sh restarts the process if it dies.
+
+## Own-order exclusion (EXCLUDE_OWN_ORDERS=1/0, default 0 in code, 1 in env_nvda_patched)
+- Was NOT implemented before: OBI, micro-price, queue_ahead, fragility, depth OBI and the taker book-walk all counted our own resting size.
+- Now subtracts our resting maker orders (older than OWN_ORDER_MIN_AGE_S, not cancelling, not takers) per price level, clamped at 0. If our order is alone at the touch, the next external level is used for the touch size.
+- Prices (bid/ask/mid) are untouched; only sizes change. Dataset snapshots add obi_l1_raw, own_bid_at_touch, own_ask_at_touch.
+- Not covered: trade-flow (TFI) still includes trades against our own orders (real flow).

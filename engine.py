@@ -185,6 +185,17 @@ class MarketMakingEngine:
         max_target = min(self.cfg.order_usd * Decimal("0.25"), self.cfg.max_position_usd * Decimal("0.10"))
         return clamp(target_usd, -max_target, max_target)
 
+    def _adv_obi_persist(self, key: str, cond: bool, now: float) -> float:
+        """Seconds the book has leaned against our open position (resets when it stops or we were flat)."""
+        st = getattr(self, "_adv_obi", None)
+        if st is None:
+            st = self._adv_obi = {}
+        since, seen = st.get(key, (now, now))
+        if (not cond) or (now - seen) > 3.0:
+            since = now
+        st[key] = (since, now)
+        return now - since
+
     def _log_taker_why(self, side, why, unreal_bps, emerg_loss_bps, adv_score, pos_ratio, mid, ledger) -> None:
         t = time.time()
         if t - getattr(self, "_last_why_ts", 0.0) < 1.0:
@@ -200,7 +211,7 @@ class MarketMakingEngine:
         if not mid or mid <= ZERO or qty <= ZERO:
             return (mid or ZERO, ZERO)
 
-        depth = md._book_depth_bids if side == SELL else md._book_depth_asks
+        depth = md.depth_levels("BUY" if side == SELL else "SELL")
         if not depth:
             touch = md.bid if side == SELL else md.ask
             if not touch:
@@ -431,6 +442,10 @@ class MarketMakingEngine:
                         elif ret_5s >= Decimal("3.0") and obi >= Decimal("0.70") and tfi >= Decimal("0.50") and unreal_bps < -self.cfg.taker_fee_bps:
                             trigger_taker = True
                             taker_why = "trend_cascade"
+                        elif (self.cfg.adv_obi_exit and self._adv_obi_persist("S", obi >= self.cfg.adv_obi_thresh, now) >= self.cfg.adv_obi_secs
+                              and unreal_bps < -self.cfg.adv_obi_loss_bps):
+                            trigger_taker = True
+                            taker_why = "adverse_obi_persist"
 
                     if trigger_taker:
                         self._log_taker_why("BUY", taker_why, unreal_bps, emerg_loss_bps, adv_score, pos_ratio, mid, ledger)
@@ -656,6 +671,10 @@ class MarketMakingEngine:
                         elif ret_5s <= -Decimal("3.0") and obi <= Decimal("-0.70") and tfi <= Decimal("-0.50") and unreal_bps < -self.cfg.taker_fee_bps:
                             trigger_taker = True
                             taker_why = "trend_cascade"
+                        elif (self.cfg.adv_obi_exit and self._adv_obi_persist("L", obi <= -self.cfg.adv_obi_thresh, now) >= self.cfg.adv_obi_secs
+                              and unreal_bps < -self.cfg.adv_obi_loss_bps):
+                            trigger_taker = True
+                            taker_why = "adverse_obi_persist"
 
                     if trigger_taker:
                         self._log_taker_why("SELL", taker_why, unreal_bps, emerg_loss_bps, adv_score, pos_ratio, mid, ledger)
