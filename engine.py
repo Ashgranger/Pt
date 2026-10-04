@@ -23,6 +23,7 @@ class QuoteTarget:
     is_exit_quote: bool
     is_taker: bool = False
     quote_mid: Optional[Decimal] = None
+    est_px: Optional[Decimal] = None
 
 
 class MarketMakingEngine:
@@ -55,11 +56,14 @@ class MarketMakingEngine:
         cross_shift = ZERO
         cross_obi_shift = ZERO
         if self.cfg.enable_cross_exchange and md.cross.venues:
-            cross_div = md.cross.lead_lag_divergence_bps(base_mid)
+            cross_div = md.cross.lead_lag_divergence_bps(base_mid, now)
             if cross_div != ZERO:
                 cross_shift = base_mid * (cross_div / BPS) * self.cfg.cross_lead_lag_weight
-            cross_obi = md.cross.cross_obi()
+            cross_obi = md.cross.cross_obi(now)
             cross_obi_shift = half_spr * cross_obi * Decimal("0.5")
+            cross_tfi = md.cross.cross_tfi(5.0, now)
+            if cross_tfi != ZERO:
+                cross_obi_shift += half_spr * cross_tfi * Decimal(str(self.cfg.cross_flow_weight))
 
         basis_shift = ZERO
         if hasattr(md, "reference_basis_bps"):
@@ -97,11 +101,31 @@ class MarketMakingEngine:
 
         cross_risk = ZERO
         if self.cfg.enable_cross_exchange and md.cross.venues:
-            cross_velo = md.cross.cross_velocity_bps(3.0, now)
+            cr = md.cross
+            cross_velo = cr.cross_velocity_bps(3.0, now)
             if side == BUY and cross_velo < -self.cfg.cross_velocity_threshold_bps:
                 cross_risk = abs(cross_velo) * Decimal("2.0")
             elif side == SELL and cross_velo > self.cfg.cross_velocity_threshold_bps:
                 cross_risk = cross_velo * Decimal("2.0")
+            # stale-quote risk: external venues already moved away from our side, Arcus has not yet
+            div = cr.lead_lag_divergence_bps(md.mid, now)
+            mult = Decimal(str(self.cfg.cross_div_adverse_mult))
+            if side == BUY and div < ZERO:
+                cross_risk += abs(div) * mult
+            elif side == SELL and div > ZERO:
+                cross_risk += div * mult
+            # external aggressive flow + forced liquidations against this side
+            ctfi = cr.cross_tfi(3.0, now)
+            if side == BUY and ctfi < Decimal("-0.2"):
+                cross_risk += abs(ctfi) * Decimal("1.5")
+            elif side == SELL and ctfi > Decimal("0.2"):
+                cross_risk += ctfi * Decimal("1.5")
+            liq_down, liq_up = cr.liq_pressure_usd(5.0, now)
+            liq_thr = Decimal(str(max(self.cfg.cross_liq_usd, 1.0)))
+            if side == BUY and liq_down > 0:
+                cross_risk += min(Decimal("4"), Decimal(str(liq_down)) / liq_thr * Decimal("2"))
+            elif side == SELL and liq_up > 0:
+                cross_risk += min(Decimal("4"), Decimal(str(liq_up)) / liq_thr * Decimal("2"))
 
         total_adverse = base_tox + momentum_risk + flow_risk + cross_risk
         return total_adverse
@@ -137,7 +161,7 @@ class MarketMakingEngine:
         alpha_bps += flow_signal * Decimal("1.5")
 
         if self.cfg.enable_cross_exchange and md.cross.venues and md.mid:
-            div = md.cross.lead_lag_divergence_bps(md.mid)
+            div = md.cross.lead_lag_divergence_bps(md.mid, now)
             alpha_bps += div * Decimal("0.5")
 
         if getattr(self.cfg, "enable_funding_carry", True) and md.info and getattr(md.info, "funding_rate", ZERO) != ZERO:
@@ -234,6 +258,8 @@ class MarketMakingEngine:
         spr_bps = md.spread_bps
         spr_ticks = (md.ask - md.bid) / tick if (tick > ZERO and md.ask and md.bid) else Decimal("10")
         tick_bps = (tick / mid) * BPS if mid > ZERO else Decimal("0.1")
+        # Never let the emergency taker stop sit inside tick noise (coarse-tick tokens: 1 tick can be ~2bps)
+        emerg_loss_bps = max(self.cfg.emergency_taker_loss_bps, tick_bps * Decimal("4"))
         is_liquid_market = (spr_bps <= Decimal("1.2") or spr_ticks <= Decimal("2.5"))
         l = ledger.learner if (ledger and hasattr(ledger, "learner") and self.cfg.enable_online_learning) else None
         min_edge = l.min_edge_bps if l else self.cfg.min_edge_bps
@@ -381,7 +407,7 @@ class MarketMakingEngine:
                     if self.cfg.enable_smart_inventory_mgmt:
                         if unreal_bps < -self.cfg.stress_loss_bps:
                             trigger_taker = True
-                        elif unreal_bps < -self.cfg.emergency_taker_loss_bps and (has_adverse_flow or adv_score >= self.cfg.emergency_taker_score_threshold):
+                        elif unreal_bps < -emerg_loss_bps and (has_adverse_flow or adv_score >= self.cfg.emergency_taker_score_threshold):
                             trigger_taker = True
                         elif pos_ratio >= Decimal("0.80") and unreal_bps < -Decimal("3.0") and has_adverse_flow:
                             trigger_taker = True
@@ -390,12 +416,13 @@ class MarketMakingEngine:
 
                     if trigger_taker and md.ask and qty >= m.min_size:
                         vwap, cross_cost = self.calculate_vwap_cross_cost(BUY, qty, md)
-                        slip_buffer = max(Decimal("2") * tick, q_up(md.ask * Decimal("0.0015"), tick))
+                        slip_buffer = max(Decimal("2") * tick, q_up(md.ask * self.cfg.taker_slip_bps / BPS, tick))
                         taker_px = q_up(max(md.ask, vwap) + slip_buffer, tick)
+                        est_px = min(max(md.ask, vwap), taker_px)   # what a CLOB IOC really pays: walk of the book
                         quotes.append(QuoteTarget(
                             pair_index=0, side=BUY, price=taker_px, qty=qty,
                             expected_value_bps=-cross_cost, fill_probability=1.0,
-                            is_exit_quote=True, is_taker=True, quote_mid=mid
+                            is_exit_quote=True, is_taker=True, quote_mid=mid, est_px=est_px
                         ))
                     else:
                         min_profit_bps = max(self.cfg.exit_min_profit_bps, Decimal("1.0"))
@@ -598,7 +625,7 @@ class MarketMakingEngine:
                     if self.cfg.enable_smart_inventory_mgmt:
                         if unreal_bps < -self.cfg.stress_loss_bps:
                             trigger_taker = True
-                        elif unreal_bps < -self.cfg.emergency_taker_loss_bps and (has_adverse_flow or adv_score >= self.cfg.emergency_taker_score_threshold):
+                        elif unreal_bps < -emerg_loss_bps and (has_adverse_flow or adv_score >= self.cfg.emergency_taker_score_threshold):
                             trigger_taker = True
                         elif pos_ratio >= Decimal("0.80") and unreal_bps < -Decimal("3.0") and has_adverse_flow:
                             trigger_taker = True
@@ -607,12 +634,13 @@ class MarketMakingEngine:
 
                     if trigger_taker and md.bid and qty >= m.min_size:
                         vwap, cross_cost = self.calculate_vwap_cross_cost(SELL, qty, md)
-                        slip_buffer = max(Decimal("2") * tick, q_down(md.bid * Decimal("0.0015"), tick))
+                        slip_buffer = max(Decimal("2") * tick, q_down(md.bid * self.cfg.taker_slip_bps / BPS, tick))
                         taker_px = q_down(min(md.bid, vwap) - slip_buffer, tick)
+                        est_px = max(min(md.bid, vwap), taker_px)
                         quotes.append(QuoteTarget(
                             pair_index=0, side=SELL, price=taker_px, qty=qty,
                             expected_value_bps=-cross_cost, fill_probability=1.0,
-                            is_exit_quote=True, is_taker=True, quote_mid=mid
+                            is_exit_quote=True, is_taker=True, quote_mid=mid, est_px=est_px
                         ))
                     else:
                         min_profit_bps = max(self.cfg.exit_min_profit_bps, Decimal("1.0"))

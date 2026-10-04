@@ -385,6 +385,23 @@ class TestLevel7MarketMaker(unittest.IsolatedAsyncioTestCase):
         self.assertLess(ask_order.price, D("80010.0"), "Ask should be shaded down to breakeven maker under adverse flow")
         print("✓ test_15_smart_inventory_fast_breakeven_unwind passed: Flow-accelerated breakeven unwind active.")
 
+    async def test_17_taker_fill_booked_at_book_price_not_far_limit(self):
+        """Regression: IOC taker exits were booked at their far-through limit (-15..-18bps phantom loss)."""
+        bot, s, clock = sim.make(EXTRA_LEVELS=0, ORDER_USD=20, MAX_POSITION_USD=100,
+                                 EXIT_MIN_PROFIT_BPS="1.5", ENABLE_SMART_INVENTORY_MGMT=1,
+                                 MIN_REQUOTE_S="0.1", EMERGENCY_TAKER_LOSS_BPS="6.0")
+        await sim.step(bot, s, clock, "80000.0", "80080.0")
+        s.taker(SELL)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        clock.t += 0.5
+        s.push_trade(SELL, "2.0", "79900.0")
+        await sim.step(bot, s, clock, "79900.0", "79920.0", bsz="0.1", asz="2.0")
+        f = bot.ledger.fills[-1]
+        self.assertEqual(bot.ledger.position, D(0))
+        self.assertGreaterEqual(f.price, D("79899.0"), "taker must be booked near the touch (bid 79900), not at its limit")
+        self.assertGreater(f.edge_bps, D("-3"))
+
     async def test_16_emergency_taker_cut_on_adverse_cascade(self):
         """Test Emergency Taker Cut: When adverse loss and flow exceed threshold, bot fires IOC taker order to cut loss."""
         bot, s, clock = sim.make(EXTRA_LEVELS=0, ORDER_USD=20, MAX_POSITION_USD=100,
@@ -895,3 +912,205 @@ class TestDeadMansSwitch(unittest.IsolatedAsyncioTestCase):
         await bot._heartbeat(clock.t + 1)   # inside refresh interval -> no extra call
         self.assertEqual(len(seen), n)
         print("✓ test_34_schedule_cancel passed: signed correctly, armed, refresh throttled.")
+
+
+# ============================================================================ #
+# Cross-venue feeds (Binance / Bybit) + signals
+# ============================================================================ #
+import json as _json
+import feeds as _feeds
+from market import CrossVenueTracker
+
+
+class _Sink:
+    def __init__(self):
+        self.bbo, self.depth, self.trades, self.liqs, self.disc = [], [], [], [], []
+    def on_external_venue_bbo(self, v, b, a, bs, as_): self.bbo.append((v, b, a, bs, as_))
+    def on_external_depth(self, v, b, a): self.depth.append((v, b, a))
+    def on_external_trade(self, v, side, sz, px): self.trades.append((v, side, sz, px))
+    def on_external_liq(self, v, side, sz, px): self.liqs.append((v, side, sz, px))
+    def on_external_disconnect(self, v): self.disc.append(v)
+
+
+class TestCrossVenueFeeds(unittest.TestCase):
+    def test_35_binance_parsing(self):
+        sk = _Sink()
+        f = _feeds.BinanceFeed(sk, "SOLUSDT", "wss://x")
+        self.assertIn("solusdt@bookTicker", f.full_url())
+        self.assertIn("solusdt@depth10@100ms", f.full_url())
+        f.handle(_json.dumps({"stream": "solusdt@bookTicker", "data": {"e": "bookTicker", "s": "SOLUSDT",
+                              "b": "100.10", "B": "5", "a": "100.12", "A": "7"}}))
+        f.handle(_json.dumps({"stream": "x", "data": {"e": "depthUpdate", "b": [["100.10", "5"]], "a": [["100.12", "7"]]}}))
+        f.handle(_json.dumps({"data": {"e": "aggTrade", "p": "100.1", "q": "2", "m": True}}))    # aggressor SELL
+        f.handle(_json.dumps({"data": {"e": "aggTrade", "p": "100.1", "q": "3", "m": False}}))   # aggressor BUY
+        f.handle(_json.dumps({"data": {"e": "forceOrder", "o": {"S": "SELL", "q": "400", "z": "400", "p": "99", "ap": "99.5"}}}))
+        self.assertEqual(sk.bbo[0], ("BINANCE", D("100.10"), D("100.12"), D("5"), D("7")))
+        self.assertEqual(len(sk.depth), 1)
+        self.assertEqual([t[1] for t in sk.trades], ["SELL", "BUY"])
+        self.assertEqual(sk.liqs[0][:2], ("BINANCE", "SELL"))
+        self.assertEqual(sk.liqs[0][3], D("99.5"))
+        print("✓ test_35 passed: Binance bookTicker/depth/aggTrade/forceOrder parsed with correct aggressor sides.")
+
+    def test_36_bybit_book_delta_and_sides(self):
+        sk = _Sink()
+        f = _feeds.BybitFeed(sk, "SOLUSDT", "wss://x")
+        snap = {"topic": "orderbook.50.SOLUSDT", "type": "snapshot", "data": {"s": "SOLUSDT", "u": 5,
+                "b": [["100.0", "4"], ["99.9", "6"]], "a": [["100.2", "3"], ["100.3", "9"]]}}
+        f.handle(_json.dumps(snap))
+        self.assertEqual(sk.bbo[-1][1:3], (D("100.0"), D("100.2")))
+        # delta: new better bid, delete best ask, update 2nd level
+        f.handle(_json.dumps({"topic": "orderbook.50.SOLUSDT", "type": "delta", "data": {"u": 6,
+                 "b": [["100.1", "2"]], "a": [["100.2", "0"], ["100.3", "8"]]}}))
+        self.assertEqual(sk.bbo[-1][1:3], (D("100.1"), D("100.3")))
+        self.assertEqual(sk.depth[-1][2][0], ("100.3", "8"))
+        # crossed (out-of-sync) book is ignored
+        n = len(sk.bbo)
+        f.handle(_json.dumps({"topic": "orderbook.50.SOLUSDT", "type": "delta", "data": {"u": 7, "b": [["100.5", "1"]], "a": []}}))
+        self.assertEqual(len(sk.bbo), n)
+        f.handle(_json.dumps({"topic": "publicTrade.SOLUSDT", "data": [{"S": "Buy", "v": "2", "p": "100.1"},
+                                                                       {"S": "Sell", "v": "1", "p": "100.0"}]}))
+        self.assertEqual([t[1] for t in sk.trades], ["BUY", "SELL"])
+        # long position liquidated (Bybit side=Buy) => forced SELL
+        f.handle(_json.dumps({"topic": "liquidation.SOLUSDT", "data": {"side": "Buy", "size": "50", "price": "99"}}))
+        self.assertEqual(sk.liqs[-1][1], "SELL")
+        self.assertEqual(_feeds.derive_symbol("SOL-USD"), "SOLUSDT")
+        self.assertEqual(_feeds.derive_symbol("PEPE-USD", "1000pepeusdt"), "1000PEPEUSDT")
+        print("✓ test_36 passed: Bybit snapshot/delta/delete, crossed-book guard, trade & liquidation sides.")
+
+    def test_37_basis_lead_stale_and_no_venue_mixing(self):
+        cr = CrossVenueTracker()
+        t = 0.0
+        loc = D("100")
+        # Binance trades 5bps ABOVE arcus (USDT premium), Bybit 3bps above - constant offsets
+        for i in range(200):
+            t += 0.25
+            cr.update_venue("BINANCE", loc * D("1.0005") - D("0.005"), loc * D("1.0005") + D("0.005"), D(1), D(1), t)
+            cr.update_venue("BYBIT", loc * D("1.0003") - D("0.005"), loc * D("1.0003") + D("0.005"), D(1), D(1), t)
+            cr.observe_local(loc, t)
+        self.assertLess(abs(cr.lead_lag_divergence_bps(loc, t)), D("0.3"), "constant basis must be removed")
+        self.assertLess(abs(cr.cross_velocity_bps(3.0, t)), D("0.01"), "two flat venues at different prices => zero velocity")
+        # real lead: both venues jump +4bps, arcus unchanged
+        t += 0.25
+        for v, k in (("BINANCE", "1.0009"), ("BYBIT", "1.0007")):
+            cr.update_venue(v, loc * D(k) - D("0.005"), loc * D(k) + D("0.005"), D(1), D(1), t)
+        div = cr.lead_lag_divergence_bps(loc, t)
+        self.assertGreater(div, D("3.0"))
+        blk_buy, blk_sell, why = cr.pull_decision(loc, t, 2.5, 99.0, 0)
+        self.assertTrue(blk_sell and not blk_buy, "ext above arcus => our ask is stale => pull ask")
+        # consensus: only ONE venue moves => no pull
+        cr2 = CrossVenueTracker()
+        t2 = 0.0
+        for i in range(200):
+            t2 += 0.25
+            cr2.update_venue("BINANCE", loc - D("0.005"), loc + D("0.005"), D(1), D(1), t2)
+            cr2.update_venue("BYBIT", loc - D("0.005"), loc + D("0.005"), D(1), D(1), t2)
+            cr2.observe_local(loc, t2)
+        t2 += 0.25
+        cr2.update_venue("BINANCE", loc * D("0.9995") - D("0.005"), loc * D("0.9995") + D("0.005"), D(1), D(1), t2)
+        cr2.update_venue("BYBIT", loc - D("0.005"), loc + D("0.005"), D(1), D(1), t2)
+        self.assertEqual(cr2.pull_decision(loc, t2, 2.5, 99.0, 0)[:2], (False, False))
+        # staleness: silent venues stop influencing anything
+        self.assertEqual(cr.lead_lag_divergence_bps(loc, t + 5.0), D("0"))
+        self.assertEqual(cr.cross_obi(t + 5.0), D("0"))
+        # disconnect drops the venue immediately
+        cr.drop_venue("BINANCE")
+        self.assertNotIn("BINANCE", cr.venues)
+        print("✓ test_37 passed: basis removed, real lead detected, consensus required, stale/disconnect safe.")
+
+    def test_38_flow_liquidation_depth(self):
+        cr = CrossVenueTracker()
+        t = 10.0
+        cr.update_trade("BINANCE", "SELL", D(500), D(100), t)       # $50k aggressive selling
+        cr.update_trade("BYBIT", "BUY", D(50), D(100), t)           # $5k buying
+        self.assertLess(cr.cross_tfi(3.0, t), D("-0.4"))
+        cr.update_trade("BINANCE", "BUY", D(1), D(100), t - 0.0)
+        self.assertEqual(cr.cross_tfi(3.0, t + 10), D("0"))         # outside window
+        cr.update_liquidation("BINANCE", "SELL", D(1000), D(100), t)   # $100k longs liquidated
+        down, up = cr.liq_pressure_usd(5.0, t)
+        self.assertEqual((down, up), (100000.0, 0.0))
+        self.assertEqual(cr.pull_decision(D(100), t, 99.0, 99.0, 50000.0)[:2], (True, False))
+        cr.update_depth("BINANCE", [["100", "10"], ["99.9", "10"]], [["100.1", "1"], ["100.2", "1"]], t)
+        self.assertGreater(cr.venues["BINANCE"].obi, D("0.7"))
+        print("✓ test_38 passed: external trade flow, liquidation pull, depth-weighted OBI.")
+
+
+class TestCrossFeedLoop(unittest.IsolatedAsyncioTestCase):
+    async def test_39_reconnect_resubscribe_and_disconnect_callback(self):
+        sk = _Sink()
+        sent, conns = [], []
+
+        class FakeWS:
+            def __init__(self, msgs): self.msgs = list(msgs)
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): return False
+            async def send(self, m): sent.append(m)
+            async def recv(self):
+                if self.msgs:
+                    return self.msgs.pop(0)
+                await asyncio.sleep(10)      # idle -> triggers idle timeout reconnect
+
+        def connect(url):
+            conns.append(url)
+            return FakeWS([_json.dumps({"topic": "publicTrade.SOLUSDT", "data": [{"S": "Buy", "v": "1", "p": "100"}]})])
+
+        f = _feeds.BybitFeed(sk, "SOLUSDT", "wss://fake", connect)
+        f.idle_timeout_s = 0.05
+        task = asyncio.create_task(f.run())
+        await asyncio.sleep(1.6)       # first reconnect backoff is 1s
+        f.stop(); task.cancel()
+        try: await task
+        except asyncio.CancelledError: pass
+        self.assertGreaterEqual(len(conns), 2, "must reconnect after idle")
+        subs = [m for m in sent if '"subscribe"' in m]
+        self.assertGreaterEqual(len(subs), 2, "must resubscribe on every connect")
+        self.assertIn("orderbook.50.SOLUSDT", subs[0])
+        self.assertIn("BYBIT", sk.disc)
+        self.assertGreaterEqual(len(sk.trades), 2)
+        print("✓ test_39 passed: idle->reconnect, resubscribe, disconnect callback clears venue.")
+
+    async def test_40_bot_pulls_stale_bid_when_external_venues_drop(self):
+        bot, s, clock = sim.make(EXTRA_LEVELS=0, ENABLE_CROSS_EXCHANGE=1, CROSS_WARMUP_S="5", CROSS_PULL_BPS="2.5",
+                                 CROSS_VEL_PULL_BPS="50")
+        def ext(px_mult):
+            for v in ("BINANCE", "BYBIT"):
+                mid = D("80050") * D(px_mult)
+                bot.on_external_venue_bbo(v, mid - D("2"), mid + D("2"))
+        for _ in range(40):                                  # 10s of calm: learns basis (+3bps USDT premium)
+            ext("1.0003")
+            await sim.step(bot, s, clock, "80000.0", "80100.0")
+        self.assertIsNotNone(bot.om.get_order_by_slot(0, BUY), "bid quoted in calm market")
+        self.assertLess(abs(bot.md.cross.lead_lag_divergence_bps(bot.md.mid, clock.t)), D("0.5"))
+        ext("0.9995")                                        # both venues drop ~8bps vs learned basis; arcus stale
+        await sim.step(bot, s, clock, "80000.0", "80100.0")
+        self.assertIsNone(bot.om.get_order_by_slot(0, BUY), "stale bid must be pulled")
+        self.assertIsNotNone(bot.om.get_order_by_slot(0, SELL), "ask on the safe side is kept")
+        print("✓ test_40 passed: bot pulled the stale bid ahead of Arcus repricing (ask kept).")
+
+
+class TestBybitSubscriptionFix(unittest.IsolatedAsyncioTestCase):
+    async def test_41_bybit_subscribes_separately_and_survives_bad_liquidation_topic(self):
+        sk = _Sink()
+        sent = []
+        class WS:
+            async def send(self, m): sent.append(_json.loads(m))
+        f = _feeds.BybitFeed(sk, "PUMPUSDT", "wss://x")
+        await f.on_open(WS())
+        self.assertEqual(sent[0]["args"], ["orderbook.50.PUMPUSDT", "publicTrade.PUMPUSDT"])
+        self.assertEqual(sent[1]["args"], ["allLiquidation.PUMPUSDT"])   # separate request
+        # exchange rejects the liquidation topic: price feed must NOT be disabled; legacy topic tried once
+        f.handle(_json.dumps({"success": False, "ret_msg": "error:handler not found,topic:allLiquidation.PUMPUSDT", "op": "subscribe"}))
+        self.assertFalse(f.disabled)
+        self.assertEqual(f._resub, ["liquidation.PUMPUSDT"])
+        f.handle(_json.dumps({"success": False, "ret_msg": "error:handler not found,topic:liquidation.PUMPUSDT", "op": "subscribe"}))
+        self.assertFalse(f.disabled)
+        # price data still flows
+        f.handle(_json.dumps({"topic": "orderbook.50.PUMPUSDT", "type": "snapshot", "data": {"u": 3,
+                 "b": [["0.0057", "100"]], "a": [["0.0058", "100"]]}}))
+        self.assertEqual(len(sk.bbo), 1)
+        # new allLiquidation payload (S=Buy => long liquidated => forced SELL)
+        f.handle(_json.dumps({"topic": "allLiquidation.PUMPUSDT", "data": [{"T": 1, "s": "PUMPUSDT", "S": "Buy", "v": "1000", "p": "0.0057"}]}))
+        self.assertEqual(sk.liqs[-1][1], "SELL")
+        # a bad ORDERBOOK subscription (symbol not listed) disables the feed instead of reconnect-looping
+        f.handle(_json.dumps({"success": False, "ret_msg": "error:handler not found,topic:orderbook.50.PUMPUSDT", "op": "subscribe"}))
+        self.assertTrue(f.disabled)
+        print("✓ test_41 passed: Bybit liquidation rejection no longer kills the price feed.")

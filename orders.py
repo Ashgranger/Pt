@@ -36,6 +36,7 @@ class Order:
     is_reduce_only: bool = False
     ev_bps: Decimal = Decimal(0)
     quote_mid: Optional[Decimal] = None
+    est_px: Optional[Decimal] = None
 
 
 class OrderManager:
@@ -46,6 +47,7 @@ class OrderManager:
         self.on_fill = on_fill
         
         self.orders: dict[str, Order] = {}
+        self._last_taker: dict = {}
         self.pair_slots: dict[Tuple[int, str], str] = {}
         self._unmatched: dict[str, tuple] = {}
         self.reject_until = {BUY: 0.0, SELL: 0.0}
@@ -110,7 +112,8 @@ class OrderManager:
 
     async def place(self, pair_index: int, side: str, px: Decimal, qty: Decimal, now: float,
                     time_in_force: str = "ALO", reduce_only: bool = False,
-                    quote_mid: Optional[Decimal] = None) -> Optional[Order]:
+                    quote_mid: Optional[Decimal] = None,
+                    est_px: Optional[Decimal] = None) -> Optional[Order]:
         if now < self.paused_until or not self._budget(now):
             return None
         m = self.get_market()
@@ -140,7 +143,7 @@ class OrderManager:
         self.n_place += 1
         oid = str(res["orderId"])
         o = Order(oid, pair_index, side, px, qty, qty, good_til, now, now,
-                  is_taker=is_taker, is_reduce_only=reduce_only, quote_mid=quote_mid)
+                  is_taker=is_taker, is_reduce_only=reduce_only, quote_mid=quote_mid, est_px=est_px)
         self.orders[oid] = o
         if not is_taker:
             self.pair_slots[(pair_index, side)] = oid
@@ -272,12 +275,17 @@ class OrderManager:
         existing = self.get_order_by_slot(t.pair_index, t.side)
 
         if getattr(t, "is_taker", False):
+            last = self._last_taker.get(t.side)
+            if last is not None and now - last < 1.5:
+                return            # previous IOC still settling: never double-send a taker
+            self._last_taker[t.side] = now
             if existing:
                 await self.cancel(existing, now)
                 self.pair_slots.pop(slot, None)
             await self.place(t.pair_index, t.side, t.price, t.qty, now,
                              time_in_force="IOC", reduce_only=True,
-                             quote_mid=getattr(t, "quote_mid", None))
+                             quote_mid=getattr(t, "quote_mid", None),
+                             est_px=getattr(t, "est_px", None))
             return
 
         is_exit = bool(getattr(t, "is_exit_quote", False))
@@ -349,8 +357,22 @@ class OrderManager:
         try:
             if c.get("price"):
                 px = Decimal(str(c["price"]))
+            # takers: record the real execution price when the exchange reports it, not our limit
+            for k in ("avgPrice", "averagePrice", "avgFillPrice", "lastFillPrice", "fillPrice"):
+                v = c.get(k)
+                if v and Decimal(str(v)) > 0:
+                    px = Decimal(str(v))
+                    break
         except Exception:
             pass
+        if o.is_taker and (filled or state == "PARTIALLY_FILLED"):
+            real = any(c.get(k) and Decimal(str(c[k])) > 0
+                       for k in ("avgPrice", "averagePrice", "avgFillPrice", "lastFillPrice", "fillPrice"))
+            # Always dump the raw update once per taker event so the true execution-price field can be confirmed.
+            log.info("TAKER_RAW limit=%s est=%s real_px_field=%s raw=%s", fmt(o.price), fmt(o.est_px) if o.est_px else "-",
+                     real, json.dumps(c, default=str)[:500])
+            if not real and o.est_px and getattr(self.cfg, "taker_fill_price_mode", "est") == "est":
+                px = o.est_px   # exchange sent no execution price: book the book-walk estimate, NOT our far-through limit
         fill_qty = Decimal(0)
         rem = c.get("remainingSize")
         if rem is not None:

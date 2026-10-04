@@ -14,6 +14,7 @@ from typing import Any, Optional
 
 from config import Config
 from exchange import Exchange
+from feeds import CrossFeedManager
 from market import Market, MarketData
 from signer import Signer
 from ledger import Ledger, Fill
@@ -40,6 +41,39 @@ def extract_positions(c: Any) -> list:
     return []
 
 
+from datetime import datetime as _dt
+try:
+    from zoneinfo import ZoneInfo as _ZI
+    _ET = _ZI("America/New_York")
+except Exception:  # pragma: no cover
+    _ET = None
+
+
+def et_hhmmss(ts: float) -> str:
+    """US Eastern wall-clock for a unix timestamp (handles EST/EDT)."""
+    try:
+        return _dt.fromtimestamp(ts, _ET).strftime("%H:%M:%S") if _ET else ""
+    except Exception:
+        return ""
+
+
+def in_et_windows(spec: str, ts: float) -> bool:
+    """spec like '09:30-09:50,15:50-16:00' (ET). Empty = never."""
+    if not spec or not _ET:
+        return False
+    cur = _dt.fromtimestamp(ts, _ET)
+    mins = cur.hour * 60 + cur.minute
+    for part in spec.split(","):
+        try:
+            a, z = part.strip().split("-")
+            ah, am = a.split(":"); zh, zm = z.split(":")
+            if int(ah) * 60 + int(am) <= mins < int(zh) * 60 + int(zm):
+                return True
+        except Exception:
+            continue
+    return False
+
+
 class MarketMaker:
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -50,6 +84,7 @@ class MarketMaker:
         self.md = MarketData(cfg)
         self.signer = Signer(cfg.signing_key, cfg.address, cfg.account_index)
         self.ledger = Ledger(cfg)
+        self.ledger.on_markout_cb = self._journal_markout
         self.engine = MarketMakingEngine(cfg)
         self.om = OrderManager(cfg, self.ex, self.signer, self._get_market, self._on_fill)
 
@@ -66,6 +101,9 @@ class MarketMaker:
         self._tick_lock = asyncio.Lock()
         self._dirty_evt = asyncio.Event()
         self._bg_tasks: dict = {}
+        self._last_ext_wake = 0.0
+        self._cross_feeds = None
+        self._last_cross_log = 0.0
         self._dms_armed = False
         self._dms_fail = 0
         self._dms_ok_until = 0.0
@@ -152,10 +190,35 @@ class MarketMaker:
                 if pmt != ZERO:
                     self.ledger.apply_funding(pmt)
 
+    def _wake_throttled(self) -> None:
+        """External feeds can emit hundreds of msgs/s; wake the quote loop at most every 20ms."""
+        t = self.now()
+        if t - self._last_ext_wake >= 0.02:
+            self._last_ext_wake = t
+            self._dirty_evt.set()
+
     def on_external_venue_bbo(self, venue: str, bid: Decimal, ask: Decimal,
                               bid_sz: Decimal = Decimal("1"), ask_sz: Decimal = Decimal("1")) -> None:
+        if bid >= ask:
+            return
         self.md.update_cross_venue(venue, bid, ask, bid_sz, ask_sz, self.now())
+        self._wake_throttled()
+
+    def on_external_depth(self, venue: str, bids: list, asks: list) -> None:
+        self.md.update_cross_depth(venue, bids, asks, self.now())
+
+    def on_external_trade(self, venue: str, side: str, size: Decimal, price: Decimal) -> None:
+        self.md.update_cross_trade(venue, side, size, price, self.now())
+
+    def on_external_liq(self, venue: str, side: str, size: Decimal, price: Decimal) -> None:
+        self.md.update_cross_liq(venue, side, size, price, self.now())
+        log.warning("LIQUIDATION %s forced-%s %s @ %s (~$%s)", venue, side, size, price,
+                    f"{float(size * price):,.0f}")
         self._dirty_evt.set()
+
+    def on_external_disconnect(self, venue: str) -> None:
+        self.md.cross.drop_venue(venue)
+        log.warning("Cross-venue feed %s disconnected - its signals are disabled until it reconnects", venue)
 
     def _handle_trade(self, tr: dict, now: float) -> None:
         try:
@@ -176,9 +239,18 @@ class MarketMaker:
         is_maker = not getattr(o, "is_taker", False)
         fill = self.ledger.on_fill(side, qty, price, mid, now, min_notional, is_maker=is_maker)
         current_mid = self.md.mid or price
-        log.info("FILL L%d %s %s @ %s | edge=%sbps pos=%s pnl=$%s",
+        log.info("FILL L%d %s %s @ %s | edge=%sbps pos=%s pnl=$%s ET=%s",
                  o.pair_index, side, fmt(qty), fmt(price), fmt(fill.edge_bps),
-                 fmt(self.ledger.position), fmt(self.ledger.total_pnl(current_mid)))
+                 fmt(self.ledger.position), fmt(self.ledger.total_pnl(current_mid)),
+                 et_hhmmss(time.time()))
+        try:
+            self._fill_ctx = {
+                "level": o.pair_index, "et": et_hhmmss(time.time()),
+                "obi": float(self.md.obi), "tfi": float(self.md.trade_flow_imbalance(10.0, now)),
+                "spr_bps": float(self.md.spread_bps), "taker": bool(getattr(o, "is_taker", False)),
+            }
+        except Exception:
+            self._fill_ctx = {"level": o.pair_index, "et": et_hhmmss(time.time())}
 
         self._recent_fills.append((now, side))
         while self._recent_fills and now - self._recent_fills[0][0] > self.cfg.burst_window_s:
@@ -238,8 +310,20 @@ class MarketMaker:
             "realized_delta": fmt(f.realized_delta), "total_realized": fmt(self.ledger.realized),
             "fees": fmt(self.ledger.fees)
         }
+        row.update(getattr(self, "_fill_ctx", None) or {})
         try:
             self._fp(self.cfg.journal_path).write(json.dumps(row) + "\n")
+        except Exception:
+            pass
+
+    def _journal_markout(self, f: Fill, horizon: float, m_bps) -> None:
+        """Per-fill markout rows (join to fills on fill_ts) for offline conditional-EV fitting."""
+        if not self.cfg.journal_path or self.cfg.journal_path == os.devnull:
+            return
+        try:
+            self._fp(self.cfg.journal_path).write(json.dumps({
+                "type": "markout", "fill_ts": f.ts, "side": f.side,
+                "h": horizon, "markout_bps": round(float(m_bps), 4)}) + "\n")
         except Exception:
             pass
 
@@ -360,6 +444,19 @@ class MarketMaker:
                 self._trend_blocked_until[SELL] = now + self.cfg.trend_hold_s
                 sell_blocked = True
 
+            if self.cfg.enable_cross_exchange and self.md.cross.venues:
+                cb, cs, why = self.md.cross.pull_decision(
+                    mid, now, self.cfg.cross_pull_bps, self.cfg.cross_vel_pull_bps, self.cfg.cross_liq_usd)
+                if cb:
+                    self._trend_blocked_until[BUY] = now + self.cfg.cross_pull_hold_s
+                    buy_blocked = True
+                if cs:
+                    self._trend_blocked_until[SELL] = now + self.cfg.cross_pull_hold_s
+                    sell_blocked = True
+                if (cb or cs) and now - self._last_cross_log > 5.0:
+                    self._last_cross_log = now
+                    log.info("CROSS PULL %s | %s", "BIDS" if cb and not cs else ("ASKS" if cs and not cb else "BOTH"), why)
+
             pos_usd = self.ledger.position * mid
             if self.cfg.enable_online_learning and self.md.mid:
                 ret_5s = self.md.ret_bps(5.0, now)
@@ -368,6 +465,13 @@ class MarketMaker:
 
             if self.md.move_bps(self.cfg.vol_window_s, now) >= self.cfg.vol_pause_bps:
                 # Volatility spike: pause ADDING sides, never pause UNWIND sides
+                if pos_usd >= 0:
+                    buy_blocked = True
+                if pos_usd <= 0:
+                    sell_blocked = True
+
+            if in_et_windows(self.cfg.et_pause_windows, time.time()):
+                # ET blackout (e.g. US open): stop ADDING, never block unwinds
                 if pos_usd >= 0:
                     buy_blocked = True
                 if pos_usd <= 0:
@@ -480,6 +584,15 @@ class MarketMaker:
                  regime, fmt(mid), fmt(self.md.spread_bps), fmt(self.md.obi), fmt(self.md.vol_bps),
                  fmt(self.ledger.position), fmt(self.ledger.unrealized(mid)),
                  fmt(self.ledger.total_pnl(mid)), self.om.describe(now))
+        if self.cfg.enable_cross_exchange and self.cfg.cross_feed:
+            cr = self.md.cross
+            fr = cr.fresh(now)
+            div = cr.lead_lag_divergence_bps(self.md.mid, now)
+            down, up = cr.liq_pressure_usd(30.0, now)
+            log.info("CROSS | venues=%s | div=%+.2fbps vel3s=%+.2fbps obi=%+.2f tfi5s=%+.2f disp=%.2fbps | liq30s sell=$%.0f buy=$%.0f",
+                     ",".join(v.venue for v in fr) or "NONE (feeds down - signals off)",
+                     float(div), float(cr.cross_velocity_bps(3.0, now)), float(cr.cross_obi(now)),
+                     float(cr.cross_tfi(5.0, now)), float(cr.cross_dispersion_bps(now)), down, up)
         if self.cfg.enable_online_learning:
             s = self.ledger.learner.get_summary()
             p = s["params"]
@@ -488,9 +601,9 @@ class MarketMaker:
             inv_pnl = self.ledger.inventory_pnl(mid)
             reason = s.get("last_change_reason", "none") or "none"
 
-            m1s = (f"{float(self.ledger.avg_markout_1s_bps):+.2f}bps") if self.ledger.markouts_1s else "0.00bps"
-            m5s = (f"{float(self.ledger.avg_markout_5s_bps):+.2f}bps") if self.ledger.markouts_5s else "0.00bps"
-            m_avg = (f"{float(self.ledger.avg_markout_bps):+.2f}bps") if self.ledger.markouts else "0.00bps"
+            m1s = (f"{float(Ledger.raw_mean_bps(self.ledger.markouts_1s)):+.2f}bps") if self.ledger.markouts_1s else "0.00bps"
+            m5s = (f"{float(Ledger.raw_mean_bps(self.ledger.markouts_5s)):+.2f}bps") if self.ledger.markouts_5s else "0.00bps"
+            m_avg = (f"{float(Ledger.raw_mean_bps(self.ledger.markouts)):+.2f}bps") if self.ledger.markouts else "0.00bps"
             wr = f"{s['win_rate']:.1f}%"
             afr = f"{s['adverse_fill_rate']:.1f}%"
             pnl_delta = ("+$" if realized_delta >= 0 else "-$") + f"{abs(float(realized_delta)):.2f}"
@@ -527,6 +640,10 @@ class MarketMaker:
             if not hasattr(self.ex, "ws") or self.ex.ws is None:
                 log.error("websockets package not available; install via pip install websockets")
                 return
+
+        if self.cfg.enable_cross_exchange and self.cfg.cross_feed and self._cross_feeds is None:
+            self._cross_feeds = CrossFeedManager(self.cfg, self)
+            self._cross_feeds.start()
 
         reconnect_delay = 1.0
         max_reconnect_delay = 15.0
@@ -607,4 +724,9 @@ class MarketMaker:
             await self.om.cancel_all()
         except Exception:
             pass
+        if self._cross_feeds is not None:
+            try:
+                await self._cross_feeds.stop()
+            except Exception:
+                pass
         self._close_files()
