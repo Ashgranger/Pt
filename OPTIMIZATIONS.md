@@ -54,3 +54,10 @@ Optional extra speed:  pip install uvloop orjson
 - Fix: QUOTE_OUTSIDE_RTH=0 (existing switch, pauses quoting outside 09:30-16:00 ET). ET_PAUSE_WINDOWS now wraps midnight (e.g. 18:00-09:30).
 ## Dynamic sizing (ENABLE_DYNAMIC_SIZING=1/0, default 0 in code)
 - m = clamp(inventory * edge * vol * drawdown, DYN_SIZE_MIN, 1), adding quotes only; unwinds keep position size; logs DYNSIZE.
+
+## Markout-aware exit urgency (engine.py, both unwind blocks)
+- Context: the ConditionalMarkoutModel (empirical Bayes, ledger.py) already predicted E[markout|side,regime,level] to gate new quotes (ev_bps = p_fill*(capture+pred_m-adv) - fee - inv_cost) but was never consulted when deciding how urgently to EXIT an existing position - that decision (adv_score vs EMERGENCY_TAKER_SCORE_THRESHOLD) only looked at live tfi/obi/ret_5s/cross_velo/realized side_tox.
+- Added: adv_score now also adds max(0, predict_markout(<closing side>, regime, 0, QUEUE_HORIZON_S)) * 0.5 on both sides (BUY-side prediction for short-covers, SELL-side prediction for long-exits). Sign check: markout is stored as (mid_future-fill_price) for BUY / (fill_price-mid_future) for SELL, so a positive prediction means the market is expected to keep moving further against the position we're trying to close - this can only ADD urgency (clamped at 0), never relax an existing trigger. In regimes with a negative prior (TREND/TOXIC/HIGH_VOL) it only fires once real same-regime fills have pushed the empirical mean positive, not off the prior alone.
+- Rationale: directly reuses the model that's already being trained on live fills instead of adding a new unvalidated signal; same function/args pattern already used for the entry-side EV calc.
+- Verified: all 48 tests in test_level7.py still pass unmodified (incl. test_16 emergency taker, test_18 adverse_obi_persist_exit, test_23 empirical_markout_model_predictions).
+- Not yet done: no fresh live/paper run exists with this change - treat as unvalidated until a session's worth of fills confirms it actually reduces avg loss size.
