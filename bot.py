@@ -67,7 +67,8 @@ def in_et_windows(spec: str, ts: float) -> bool:
         try:
             a, z = part.strip().split("-")
             ah, am = a.split(":"); zh, zm = z.split(":")
-            if int(ah) * 60 + int(am) <= mins < int(zh) * 60 + int(zm):
+            a_m, z_m = int(ah) * 60 + int(am), int(zh) * 60 + int(zm)
+            if (a_m <= mins < z_m) if a_m <= z_m else (mins >= a_m or mins < z_m):   # a>z = wraps midnight
                 return True
         except Exception:
             continue
@@ -409,6 +410,7 @@ class MarketMaker:
                 if until and wall >= until:                       # new UTC day: fresh loss budget
                     self._loss_pause_until = 0.0
                     self._pnl_base = tot_pnl
+                    self.ledger.dyn_pnl_base = tot_pnl
                     log.warning("Daily loss pause over - resuming quoting with a fresh loss budget")
                 if not self._loss_pause_until and (tot_pnl - getattr(self, "_pnl_base", ZERO)) <= -self.cfg.session_max_loss_usd:
                     self._loss_pause_until = (int(wall // 86400) + 1) * 86400.0

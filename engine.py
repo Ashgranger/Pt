@@ -205,6 +205,62 @@ class MarketMakingEngine:
                  side, why, float(unreal_bps), self.cfg.stress_loss_bps, float(emerg_loss_bps), float(adv_score),
                  float(pos_ratio), ledger.avg_cost, mid, ledger.hold_s(ledger.last_now or 0) if hasattr(ledger, "hold_s") else 0.0)
 
+    def dynamic_size_mult(self, side: str, pos_usd: Decimal, md: MarketData, ledger: Ledger,
+                          regime: str, now: float) -> Decimal:
+        """Per-side size multiplier in [DYN_SIZE_MIN, 1] applied to ADDING quotes only (unwinds keep position size).
+        = inventory schedule x realized-edge (Kelly-style) x volatility x drawdown.
+          inventory : linear shrink of the side that would add to the position, reaching DYN_INV_MIN at
+                      DYN_INV_CAP_FRAC of MAX_POSITION_USD (inventory-limit sizing, GLFT/AS practice)
+          edge      : recent per-side markout (bps, incl. captured half-spread) / DYN_EDGE_REF_BPS; <=0 -> floor
+                      (fractional-Kelly logic: size follows edge, zero edge -> minimum size)
+          vol       : DYN_VOL_REF_BPS / realized vol when vol exceeds the reference
+          drawdown  : shrink as session loss approaches SESSION_MAX_LOSS_USD (weight DYN_DD_WEIGHT)
+        """
+        cfg = self.cfg
+        if not cfg.enable_dynamic_sizing:
+            return ONE
+        floor = cfg.dyn_size_min
+        # 1) inventory schedule (only the side that adds to an existing position)
+        m_inv = ONE
+        if cfg.max_position_usd > ZERO:
+            f = pos_usd / cfg.max_position_usd
+            adds = (side == BUY and f > ZERO) or (side == SELL and f < ZERO)
+            if adds:
+                af = min(ONE, abs(f) / max(Decimal("0.05"), cfg.dyn_inv_cap_frac))
+                m_inv = ONE - af * (ONE - cfg.dyn_inv_min)
+        # 2) realized edge of THIS side (markout vs fill price, 5s) -> Kelly-style
+        buf = ledger.markouts_buy if side == BUY else ledger.markouts_sell
+        vals = [x[1] if isinstance(x, tuple) else x for x in buf]
+        if len(vals) < cfg.dyn_edge_min_n:
+            m_edge = cfg.dyn_warmup_mult
+            edge = None
+        else:
+            edge = sum(vals, ZERO) / Decimal(len(vals))
+            m_edge = clamp(edge / max(Decimal("0.05"), cfg.dyn_edge_ref_bps), floor, ONE)
+        # 3) volatility
+        vol = md.vol_bps
+        m_vol = ONE if vol <= cfg.dyn_vol_ref_bps else clamp(cfg.dyn_vol_ref_bps / vol, floor, ONE)
+        if regime == "REGIME_D_TOXIC":
+            m_vol = m_vol * Decimal("0.8")
+        # 4) drawdown scaling
+        m_dd = ONE
+        try:
+            if cfg.session_max_loss_usd > ZERO and md.mid:
+                pnl = ledger.total_pnl(md.mid) - getattr(ledger, "dyn_pnl_base", ZERO)
+                if pnl < ZERO:
+                    m_dd = clamp(ONE - cfg.dyn_dd_weight * (-pnl / cfg.session_max_loss_usd), floor, ONE)
+        except Exception:
+            m_dd = ONE
+        m = clamp(m_inv * m_edge * m_vol * m_dd, floor, ONE)
+        last = getattr(self, "_dyn_log", {})
+        if now - last.get(side, -1e9) >= 15.0 and m < Decimal("0.95"):
+            last[side] = now
+            self._dyn_log = last
+            log.info("DYNSIZE %s x%.2f (inv=%.2f edge=%s vol=%.2f dd=%.2f)", side, float(m), float(m_inv),
+                     ("%+.2fbps->%.2f" % (float(edge), float(m_edge))) if edge is not None else "warmup",
+                     float(m_vol), float(m_dd))
+        return m
+
     def calculate_vwap_cross_cost(self, side: str, qty: Decimal, md: MarketData) -> Tuple[Decimal, Decimal]:
         """Calculates actual VWAP price and crossing cost in bps by walking the L2 book."""
         mid = md.mid
@@ -404,9 +460,11 @@ class MarketMakingEngine:
             size_mult = Decimal(str(math.pow(float(size_mult_base), k)))
             level_usd = max(self.cfg.order_usd * size_mult, m.min_notional)
             level_edge_buy = level_edge + depth_widen_buy
-            level_usd_buy = max(level_usd * (ONE - depth_cut_buy), m.min_notional)
+            dyn_buy = self.dynamic_size_mult(BUY, pos_usd, md, ledger, regime, now)
+            dyn_sell = self.dynamic_size_mult(SELL, pos_usd, md, ledger, regime, now)
+            level_usd_buy = max(level_usd * (ONE - depth_cut_buy) * dyn_buy, m.min_notional)
             level_edge_sell = level_edge + depth_widen_sell
-            level_usd_sell = max(level_usd * (ONE - depth_cut_sell), m.min_notional)
+            level_usd_sell = max(level_usd * (ONE - depth_cut_sell) * dyn_sell, m.min_notional)
 
             # --- BUY SIDE --- #
             is_unwind_buy = (pos_usd < 0)

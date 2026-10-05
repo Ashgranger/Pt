@@ -45,3 +45,12 @@ Optional extra speed:  pip install uvloop orjson
 - Now subtracts our resting maker orders (older than OWN_ORDER_MIN_AGE_S, not cancelling, not takers) per price level, clamped at 0. If our order is alone at the touch, the next external level is used for the touch size.
 - Prices (bid/ask/mid) are untouched; only sizes change. Dataset snapshots add obi_l1_raw, own_bid_at_touch, own_ask_at_touch.
 - Not covered: trade-flow (TFI) still includes trades against our own orders (real flow).
+
+## Why it bled (log l__11, 10-04 16:20 -> 10-05 04:59, 207 fills, $62k volume)
+- Net -$3.7 = spread capture +$2.66 (0.43bps) and inventory loss -$6.37 (-1.03bps) => -0.6bps of volume.
+- 69 round trips: win rate 32%, avg win +$0.016, avg loss -$0.125 (needs ~89% wins to break even at that ratio).
+- Mean signed mid move after our fills: -0.33bps @10s, -0.49 @30s, -0.58 @60s. Half-spread earned is ~0.21bps => adverse selection > edge.
+- TIME OF DAY decides it: ET 18:00-21:59 lost -$3.43 of the -$3.48 attributable (-0.46..-1.12 bps/hr); ET 09:00-17:59 was ~flat (-$0.05 on ~$21k).
+- Fix: QUOTE_OUTSIDE_RTH=0 (existing switch, pauses quoting outside 09:30-16:00 ET). ET_PAUSE_WINDOWS now wraps midnight (e.g. 18:00-09:30).
+## Dynamic sizing (ENABLE_DYNAMIC_SIZING=1/0, default 0 in code)
+- m = clamp(inventory * edge * vol * drawdown, DYN_SIZE_MIN, 1), adding quotes only; unwinds keep position size; logs DYNSIZE.

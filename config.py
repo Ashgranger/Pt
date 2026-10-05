@@ -145,6 +145,15 @@ class Config:
     taker_slip_bps: Decimal
     adv_obi_exit: bool
     exclude_own_orders: bool
+    enable_dynamic_sizing: bool
+    dyn_size_min: Decimal
+    dyn_inv_cap_frac: Decimal
+    dyn_inv_min: Decimal
+    dyn_edge_ref_bps: Decimal
+    dyn_edge_min_n: int
+    dyn_warmup_mult: Decimal
+    dyn_vol_ref_bps: Decimal
+    dyn_dd_weight: Decimal
     own_order_min_age_s: float
     session_loss_action: str
     quote_dataset_min_s: float
@@ -298,6 +307,15 @@ class Config:
             taker_slip_bps=_d("TAKER_SLIP_BPS", "4"),
             adv_obi_exit=_b("ADV_OBI_EXIT", "0"),
             exclude_own_orders=_b("EXCLUDE_OWN_ORDERS", "0"),
+            enable_dynamic_sizing=_b("ENABLE_DYNAMIC_SIZING", "0"),
+            dyn_size_min=_d("DYN_SIZE_MIN", "0.25"),
+            dyn_inv_cap_frac=_d("DYN_INV_CAP_FRAC", "0.6"),
+            dyn_inv_min=_d("DYN_INV_MIN", "0.25"),
+            dyn_edge_ref_bps=_d("DYN_EDGE_REF_BPS", "0.4"),
+            dyn_edge_min_n=int(_e("DYN_EDGE_MIN_N", "4")),
+            dyn_warmup_mult=_d("DYN_WARMUP_MULT", "0.6"),
+            dyn_vol_ref_bps=_d("DYN_VOL_REF_BPS", "2.0"),
+            dyn_dd_weight=_d("DYN_DD_WEIGHT", "0.7"),
             own_order_min_age_s=float(_e("OWN_ORDER_MIN_AGE_S", "0.3")),
             session_loss_action=str(_e("SESSION_LOSS_ACTION", "halt")).lower(),
             quote_dataset_min_s=float(_e("QUOTE_DATASET_MIN_S", "1.0")),

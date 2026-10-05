@@ -480,6 +480,38 @@ class TestLevel7MarketMaker(unittest.IsolatedAsyncioTestCase):
         bot.om.orders["tk"] = mkd("tk", now - 5, is_taker=True)
         self.assertEqual(len(bot._own_resting()), 1)
 
+    async def test_22_dynamic_sizing_multiplier(self):
+        bot, s, clock = sim.make(ENABLE_DYNAMIC_SIZING="1", MAX_POSITION_USD="1000", SESSION_MAX_LOSS_USD="3",
+                                 DYN_SIZE_MIN="0.25", DYN_INV_CAP_FRAC="0.6", DYN_INV_MIN="0.25")
+        await sim.step(bot, s, clock, "100.00", "100.02")
+        eng, md, led = bot.engine, bot.md, bot.ledger
+        now = clock.t
+        for _ in range(6):
+            led.markouts_buy.append((now, D("0.5")))
+            led.markouts_sell.append((now, D("-0.5")))
+        flat = eng.dynamic_size_mult(BUY, D("0"), md, led, "REGIME_A_QUIET", now)
+        self.assertEqual(flat, D("1"), "positive edge + flat inventory -> full size")
+        self.assertEqual(eng.dynamic_size_mult(SELL, D("0"), md, led, "REGIME_A_QUIET", now), D("0.25"),
+                         "non-positive realized edge -> floor size")
+        half = eng.dynamic_size_mult(BUY, D("300"), md, led, "REGIME_A_QUIET", now)   # f=0.3 of cap 0.6 -> halfway
+        self.assertTrue(D("0.55") < half < D("0.7"), half)
+        self.assertEqual(eng.dynamic_size_mult(BUY, D("-300"), md, led, "REGIME_A_QUIET", now), D("1"),
+                         "the side that REDUCES inventory is not shrunk by the inventory schedule")
+        self.assertEqual(eng.dynamic_size_mult(BUY, D("900"), md, led, "REGIME_A_QUIET", now), D("0.25"))
+        bot_off, s2, c2 = sim.make(ENABLE_DYNAMIC_SIZING="0")
+        self.assertEqual(bot_off.engine.dynamic_size_mult(SELL, D("900"), bot_off.md, bot_off.ledger, "REGIME_D_TOXIC", 0.0), D("1"))
+
+    async def test_23_et_window_wraps_midnight(self):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        import bot as botmod
+        et = ZoneInfo("America/New_York")
+        at = lambda h, m: datetime(2026, 10, 5, h, m, tzinfo=et).timestamp()
+        self.assertTrue(botmod.in_et_windows("18:00-09:30", at(20, 15)))
+        self.assertTrue(botmod.in_et_windows("18:00-09:30", at(3, 0)))
+        self.assertFalse(botmod.in_et_windows("18:00-09:30", at(12, 0)))
+        self.assertTrue(botmod.in_et_windows("09:30-09:45,18:00-09:30", at(9, 35)))
+
     async def test_16_emergency_taker_cut_on_adverse_cascade(self):
         """Test Emergency Taker Cut: When adverse loss and flow exceed threshold, bot fires IOC taker order to cut loss."""
         bot, s, clock = sim.make(EXTRA_LEVELS=0, ORDER_USD=20, MAX_POSITION_USD=100,
