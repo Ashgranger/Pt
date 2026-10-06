@@ -122,6 +122,8 @@ class CrossVenueTracker:
         self._basis: dict = {}                   # venue -> _Basis
         self._trades: deque = deque()            # (now, venue, side, usd)
         self._liqs: deque = deque()              # (now, venue, side, usd)  side = FORCED order side
+        self._liq_total: dict = {}                # venue -> lifetime event count (liq30s=$0 alone can't tell
+        self._liq_last_ts: dict = {}               # venue -> ts of last event seen       "quiet" from "dead")
         self._last_now = 0.0
         self._cache: dict = {}
 
@@ -169,7 +171,19 @@ class CrossVenueTracker:
         self._liqs.append((now, venue, side.upper(), float(size * price)))
         while self._liqs and now - self._liqs[0][0] > 60.0:
             self._liqs.popleft()
+        self._liq_total[venue] = self._liq_total.get(venue, 0) + 1
+        self._liq_last_ts[venue] = now
         self._touch(now)
+
+    def liq_feed_health(self, now: float) -> dict:
+        """{venue: (lifetime_event_count, seconds_since_last_event_or_None)} for every venue that has
+        EVER sent a liquidation event this process. A venue absent here has sent zero since start -
+        that's the case liq30s=$0 can't distinguish on its own (quiet market vs. dead/rejected topic)."""
+        out = {}
+        for venue, n in self._liq_total.items():
+            last = self._liq_last_ts.get(venue)
+            out[venue] = (n, (now - last) if last is not None else None)
+        return out
 
     def drop_venue(self, venue: str) -> None:
         """Called on disconnect so a dead feed can never keep skewing quotes."""
