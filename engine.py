@@ -352,7 +352,9 @@ class MarketMakingEngine:
         min_ev_base = l.min_ev_bps if l else self.cfg.min_ev_bps
 
         fair_val = self.compute_fair_value(md, now, ledger=ledger)
-        pos_usd = ledger.position * mid
+        # Dust (< exchange min order size) can never be traded out: treat as flat so it cannot lock the bot in unwind mode.
+        pos_eff = ledger.position if abs(ledger.position) >= m.min_size else ZERO
+        pos_usd = pos_eff * mid
         target_inv_usd = self.compute_target_inventory_usd(md, now, ledger=ledger)
         res_price = self.compute_reservation_price(fair_val, pos_usd, md.vol_bps, ledger=ledger, target_inventory_usd=target_inv_usd)
 
@@ -505,7 +507,7 @@ class MarketMakingEngine:
                             trigger_taker = True
                             taker_why = "adverse_obi_persist"
 
-                    if trigger_taker:
+                    if trigger_taker and qty >= m.min_size:
                         self._log_taker_why("BUY", taker_why, unreal_bps, emerg_loss_bps, adv_score, pos_ratio, mid, ledger)
                     if trigger_taker and md.ask and qty >= m.min_size:
                         vwap, cross_cost = self.calculate_vwap_cross_cost(BUY, qty, md)
@@ -734,7 +736,7 @@ class MarketMakingEngine:
                             trigger_taker = True
                             taker_why = "adverse_obi_persist"
 
-                    if trigger_taker:
+                    if trigger_taker and qty >= m.min_size:
                         self._log_taker_why("SELL", taker_why, unreal_bps, emerg_loss_bps, adv_score, pos_ratio, mid, ledger)
                     if trigger_taker and md.bid and qty >= m.min_size:
                         vwap, cross_cost = self.calculate_vwap_cross_cost(SELL, qty, md)

@@ -585,6 +585,19 @@ class TestLevel7MarketMaker(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await run("1", "79500"), (False, True), "oracle far below book -> no BUY adds")
         self.assertEqual(await run("0", "80500"), (True, True), "off by default")
 
+    async def test_27_dust_position_does_not_lock_quoting(self):
+        bot, s, clock = sim.make(EXTRA_LEVELS=0, ORDER_USD=20, MAX_POSITION_USD=100, MIN_REQUOTE_S="0.1")
+        await sim.step(bot, s, clock, "80000.0", "80080.0")
+        m = bot._get_market()
+        bot.ledger.position = m.min_size / D(10)            # untradeable dust
+        bot.ledger.avg_cost = D("80100")                    # looks like a deep unrealized loss
+        for _ in range(4):
+            await sim.step(bot, s, clock, "80000.0", "80080.0", dt=1.0)
+        live = [o for o in bot.om.orders.values() if not o.is_taker]
+        self.assertTrue([o for o in live if o.side == BUY] and [o for o in live if o.side == SELL],
+                        "dust must be treated as flat -> normal two-sided quoting")
+        self.assertFalse([o for o in bot.om.orders.values() if o.is_taker], "no taker exit for dust")
+
     async def test_16_emergency_taker_cut_on_adverse_cascade(self):
         """Test Emergency Taker Cut: When adverse loss and flow exceed threshold, bot fires IOC taker order to cut loss."""
         bot, s, clock = sim.make(EXTRA_LEVELS=0, ORDER_USD=20, MAX_POSITION_USD=100,

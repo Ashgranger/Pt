@@ -76,3 +76,7 @@ Optional extra speed:  pip install uvloop orjson
 - markPrice, isOutsideRth, status and funding were fetched ONCE at connect. The QUOTE_OUTSIDE_RTH pause and the MAX_ORACLE_DEV guard ran on a frozen snapshot, and STATUS mark_dev was meaningless. Now refreshed every MARKET_REFRESH_S (default 5).
 - ORACLE_GUARD (default 0) blocks adds on the side that trades against the oracle; only enable after mark_dev proves predictive.
 - DMS: 10 triggers/UTC day. Use DMS_TTL_S=120 and avoid repeated restarts; the 168 retries came from a build without the quota back-off.
+
+## Dust-position lock (10-07 17:08 log)
+- A leftover position of 0.0000052 sh (below the exchange min order size, ~$0.001) was treated as a real long: engine went into UNWIND mode, computed unreal -7bps from a stale avg_cost, fired stress_loss every second, but qty < min_size so no exit order could ever be sent, and normal quoting was suppressed ("orders: none").
+- Fix: positions smaller than the market's min order size are treated as flat (engine + RTH pause); TAKER_WHY only logs when a taker order can really be placed. Test: test_27 (fails without the fix).

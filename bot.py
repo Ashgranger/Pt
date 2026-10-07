@@ -442,7 +442,7 @@ class MarketMaker:
 
             self._rth_unwind_only = False
             if m.is_outside_rth and not self.cfg.quote_outside_rth:
-                if self.ledger.position * mid == ZERO:
+                if abs(self.ledger.position) < m.min_size:
                     await self.om.cancel_all()
                     if now - self._last_pause_log["rth"] > 30.0:
                         self._last_pause_log["rth"] = now
