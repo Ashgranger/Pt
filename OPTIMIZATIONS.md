@@ -66,3 +66,13 @@ Optional extra speed:  pip install uvloop orjson
 - Signed mid move after fills: -0.32bps @10s, -0.80 @30s, -0.89 @60s vs +0.43bps edge captured: momentum through our quotes (adverse selection), not exit logic.
 - Book lean (OBI) at fill did not separate good from bad fills (-0.68 vs -0.84 @30s), so OBI-based filters add little here.
 - STATUS now prints mark / mark_dev (oracle vs mid) and compact numbers, to test whether the oracle leads the book.
+
+## Dead man's switch quota (log: "attempt 168 ... trigger limit reached (10 per UTC day)")
+- Exchange semantics (same as Hyperliquid / Polymarket Perps docs; I could not find Arcus' own page): the limit counts times the switch FIRED, not arm calls. It fires when the deadline passes without a refresh. With DMS_TTL_S=30, each restart, crash, ctrl-C that leaves orders open, or >30s stall (your earlier 10s API timeouts) counts. After 10, arming is rejected until 00:00 UTC; clearing is always allowed.
+- Bot used to retry every 5s all day (168 failed calls). Now: on the quota error it logs once, stops retrying until 00:00 UTC, and either keeps quoting without protection (DMS_REQUIRED=0) or pauses when the switch expires (DMS_REQUIRED=1).
+- Env: DMS_TTL_S=120. Avoid restarting the bot repeatedly: every restart with live orders = 1 firing.
+
+## Stale market info (found 10-07)
+- markPrice, isOutsideRth, status and funding were fetched ONCE at connect. The QUOTE_OUTSIDE_RTH pause and the MAX_ORACLE_DEV guard ran on a frozen snapshot, and STATUS mark_dev was meaningless. Now refreshed every MARKET_REFRESH_S (default 5).
+- ORACLE_GUARD (default 0) blocks adds on the side that trades against the oracle; only enable after mark_dev proves predictive.
+- DMS: 10 triggers/UTC day. Use DMS_TTL_S=120 and avoid repeated restarts; the 168 retries came from a build without the quota back-off.

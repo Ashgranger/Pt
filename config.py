@@ -145,6 +145,9 @@ class Config:
     taker_slip_bps: Decimal
     adv_obi_exit: bool
     exclude_own_orders: bool
+    market_refresh_s: float
+    oracle_guard: bool
+    oracle_guard_bps: Decimal
     enable_dynamic_sizing: bool
     dyn_size_min: Decimal
     dyn_inv_cap_frac: Decimal
@@ -307,6 +310,9 @@ class Config:
             taker_slip_bps=_d("TAKER_SLIP_BPS", "4"),
             adv_obi_exit=_b("ADV_OBI_EXIT", "0"),
             exclude_own_orders=_b("EXCLUDE_OWN_ORDERS", "0"),
+            market_refresh_s=float(_e("MARKET_REFRESH_S", "5")),
+            oracle_guard=_b("ORACLE_GUARD", "0"),
+            oracle_guard_bps=_d("ORACLE_GUARD_BPS", "3.0"),
             enable_dynamic_sizing=_b("ENABLE_DYNAMIC_SIZING", "0"),
             dyn_size_min=_d("DYN_SIZE_MIN", "0.25"),
             dyn_inv_cap_frac=_d("DYN_INV_CAP_FRAC", "0.6"),

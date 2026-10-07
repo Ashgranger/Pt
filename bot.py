@@ -111,6 +111,7 @@ class MarketMaker:
         self._dms_armed = False
         self._dms_fail = 0
         self._dms_ok_until = 0.0
+        self._dms_blocked_until = 0.0
         self._files: dict = {}
         self._tick_on_trades = os.getenv("TICK_ON_TRADES", "1").strip().lower() in ("1", "true", "yes", "on")
 
@@ -512,6 +513,16 @@ class MarketMaker:
                 if pos_usd <= 0:
                     sell_blocked = True
 
+            if self.cfg.oracle_guard and m.mark and mid and (self.now() - self.md.info_ts) <= max(15.0, 3 * self.cfg.market_refresh_s):
+                dev = (m.mark - mid) / mid * BPS          # >0: oracle above the book -> price likely to rise
+                if dev >= self.cfg.oracle_guard_bps and pos_usd <= 0:
+                    sell_blocked = True                    # don't SELL (add) below the oracle
+                elif dev <= -self.cfg.oracle_guard_bps and pos_usd >= 0:
+                    buy_blocked = True                     # don't BUY (add) above the oracle
+                if abs(dev) >= self.cfg.oracle_guard_bps and now - self._last_pause_log.get("oguard", 0.0) > 30.0:
+                    self._last_pause_log["oguard"] = now
+                    log.info("ORACLE_GUARD mark_dev=%+.2fbps -> blocking %s adds", float(dev), "SELL" if dev > 0 else "BUY")
+
             existing_slots = set(self.om.pair_slots.keys())
             targets = self.engine.generate_ladder_quotes(
                 m, self.md, self.ledger, now, buy_blocked, sell_blocked, existing_slots=existing_slots
@@ -533,6 +544,8 @@ class MarketMaker:
         interval = min(cfg.heartbeat_s, cfg.dms_ttl_s / 3.0)
         if now - self._last_heartbeat < interval:
             return
+        if time.time() < getattr(self, "_dms_blocked_until", 0.0):
+            return          # exchange said the daily trigger quota is used up: don't hammer it until 00:00 UTC
         self._last_heartbeat = now
         try:
             deadline_us = int((time.time() + cfg.dms_ttl_s) * 1_000_000)
@@ -548,6 +561,16 @@ class MarketMaker:
                 self._dms_ok_until = now + cfg.dms_ttl_s
                 return
             self._dms_fail += 1
+            err_txt = json.dumps(resp.get("error") if isinstance(resp, dict) else resp).lower()
+            if "limit reached" in err_txt or "daily_limit" in err_txt or "trigger limit" in err_txt:
+                wall = time.time()
+                self._dms_blocked_until = (int(wall // 86400) + 1) * 86400.0 + 5.0
+                self._dms_armed = False
+                log.warning("DEAD MAN'S SWITCH daily trigger quota is used up (the switch FIRED 10x today = every time the bot "
+                            "stopped refreshing for DMS_TTL_S). Not retrying until 00:00 UTC. %s",
+                            "Quoting will pause when the switch expires (DMS_REQUIRED=1)." if cfg.dms_required else
+                            "Quoting continues WITHOUT exchange-side protection (set DMS_REQUIRED=1 to pause instead).")
+                return
             if self._dms_fail in (1, 3) or self._dms_fail % 12 == 0:
                 log.error("DEAD MAN'S SWITCH NOT ARMED (attempt %d): status=%s %s",
                           self._dms_fail, resp.get("status") if isinstance(resp, dict) else None,
@@ -593,6 +616,37 @@ class MarketMaker:
             log.info("Dead man's switch disarmed")
         except Exception:
             pass
+
+    async def _refresh_market_info(self, now: float) -> None:
+        """markPrice / isOutsideRth / status / funding were only read ONCE at connect, so the oracle guard and the
+        QUOTE_OUTSIDE_RTH pause ran on a frozen snapshot. Refresh the volatile fields in place (tick/step untouched)."""
+        if self.cfg.market_refresh_s <= 0 or not self.md.info:
+            return
+        if now - getattr(self, "_last_mkt_refresh", -1e9) < self.cfg.market_refresh_s:
+            return
+        self._last_mkt_refresh = now
+        try:
+            rows = await self.ex.fetch_markets(self.cfg.market)
+            if not rows:
+                return
+            fresh = Market.from_api(rows[0])
+            info = self.md.info
+            if fresh.mark and fresh.mark > ZERO:
+                info.mark = fresh.mark
+            info.is_outside_rth = fresh.is_outside_rth
+            info.status = fresh.status
+            if fresh.funding_rate is not None:
+                info.funding_rate = fresh.funding_rate
+            if fresh.next_funding_time:
+                info.next_funding_time = fresh.next_funding_time
+            if fresh.is_outside_rth != getattr(self, "_last_rth_flag", fresh.is_outside_rth):
+                log.info("Market isOutsideRth changed -> %s", fresh.is_outside_rth)
+            self._last_rth_flag = fresh.is_outside_rth
+            self.md.info_ts = now
+        except Exception as e:
+            if now - getattr(self, "_last_mkt_err", -1e9) > 60.0:
+                self._last_mkt_err = now
+                log.warning("market info refresh failed: %s", e)
 
     async def _reconcile(self, now: float) -> None:
         if now - self._last_reconcile < self.cfg.reconcile_s:
@@ -724,6 +778,7 @@ class MarketMaker:
                         now = self.now()
                         self._spawn_bg("heartbeat", self._heartbeat, now)
                         self._spawn_bg("reconcile", self._reconcile, now)
+                        self._spawn_bg("mktinfo", self._refresh_market_info, now)
                         self._status_log(now)
 
                         await self.tick()
