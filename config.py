@@ -351,7 +351,7 @@ class Config:
             loop_s=float(_e("LOOP_S", 0.25)),
             heartbeat_s=float(_e("HEARTBEAT_S", 5)),
             dms_enabled=_b("DMS_ENABLED", "1"),
-            dms_ttl_s=min(86400.0, max(6.0, float(_e("DMS_TTL_S", 30)))),
+            dms_ttl_s=min(300.0, max(6.0, float(_e("DMS_TTL_S", 30)))),
             dms_required=_b("DMS_REQUIRED", "0"),
             reconcile_s=float(_e("RECONCILE_S", 5)),
             status_s=float(_e("STATUS_S", 15)),

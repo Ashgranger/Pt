@@ -484,12 +484,6 @@ class MarketMakingEngine:
                         if cross_velo > ZERO:
                             adv_score += cross_velo * Decimal("0.5")
                     adv_score += (sell_tox / Decimal("5.0"))
-                    # Forward-looking: what does the empirical markout model expect for a BUY right now in this
-                    # regime? A positive prediction (price tends to keep rising after buys here) means the cost
-                    # of covering this short is expected to keep growing -> treat like realized adverse flow.
-                    # Only ever ADDS urgency (clamped at ZERO) - never relaxes the existing exit triggers.
-                    pred_exit_m = l.predict_markout(BUY, regime, 0, self.cfg.queue_horizon_s) if (l and hasattr(l, "predict_markout")) else ZERO
-                    adv_score += max(ZERO, pred_exit_m) * Decimal("0.5")
 
                     trigger_taker = False
                     taker_why = ""
@@ -719,12 +713,6 @@ class MarketMakingEngine:
                         if cross_velo < ZERO:
                             adv_score += abs(cross_velo) * Decimal("0.5")
                     adv_score += (buy_tox / Decimal("5.0"))
-                    # Forward-looking: what does the empirical markout model expect for a SELL right now in this
-                    # regime? A positive prediction (price tends to keep falling after sells here) means this
-                    # long is expected to keep losing -> treat like realized adverse flow. Only ever ADDS
-                    # urgency (clamped at ZERO) - never relaxes the existing exit triggers.
-                    pred_exit_m = l.predict_markout(SELL, regime, 0, self.cfg.queue_horizon_s) if (l and hasattr(l, "predict_markout")) else ZERO
-                    adv_score += max(ZERO, pred_exit_m) * Decimal("0.5")
 
                     trigger_taker = False
                     taker_why = ""

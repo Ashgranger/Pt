@@ -512,6 +512,27 @@ class TestLevel7MarketMaker(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(botmod.in_et_windows("18:00-09:30", at(12, 0)))
         self.assertTrue(botmod.in_et_windows("09:30-09:45,18:00-09:30", at(9, 35)))
 
+    async def test_24_outside_rth_keeps_unwinding_open_position(self):
+        bot, s, clock = sim.make(QUOTE_OUTSIDE_RTH="0", EXTRA_LEVELS=0, ORDER_USD=20, MAX_POSITION_USD=100,
+                                 EXIT_MIN_PROFIT_BPS="1.5", MIN_REQUOTE_S="0.1")
+        mk = bot._get_market()
+        orig = mk.is_outside_rth
+        try:
+            await sim.step(bot, s, clock, "80000.0", "80080.0")
+            s.taker(SELL)
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            await sim.step(bot, s, clock, "80000.0", "80080.0", dt=1.0)
+            self.assertNotEqual(bot.ledger.position, D(0), "setup: should hold a position")
+            mk.is_outside_rth = True
+            for _ in range(3):
+                await sim.step(bot, s, clock, "80000.0", "80080.0", dt=1.0)
+            live = [o for o in bot.om.orders.values() if not o.is_taker]
+            self.assertTrue([o for o in live if o.side == SELL], "unwind order must stay live outside RTH")
+            self.assertFalse([o for o in live if o.side == BUY], "no new adds outside RTH")
+        finally:
+            mk.is_outside_rth = orig
+
     async def test_16_emergency_taker_cut_on_adverse_cascade(self):
         """Test Emergency Taker Cut: When adverse loss and flow exceed threshold, bot fires IOC taker order to cut loss."""
         bot, s, clock = sim.make(EXTRA_LEVELS=0, ORDER_USD=20, MAX_POSITION_USD=100,
