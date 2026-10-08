@@ -1,0 +1,157 @@
+MARKET=NVDA-USD
+DRY_RUN=1
+# Main fix: the bot lost ~99% of its money outside US hours (ET 18:00-22:00). Quote only 09:30-16:00 ET.
+# With an open position outside RTH it keeps unwinding but never adds.
+QUOTE_OUTSIDE_RTH=0
+# ===== SIZING =====
+ORDER_USD=250
+MAX_POSITION_USD=600
+EXTRA_LEVELS=1
+LEVEL_SPACING_BPS=2.5
+LEVEL_SIZE_MULT=0.60
+SKEW_BPS=3
+# ===== QUOTING =====
+MIN_EDGE_BPS=0.2
+MAX_EDGE_BPS=10
+GUARANTEE_SPREAD_CAPTURE=0
+GUARANTEE_SPREAD_CAPTURE_BPS=0
+MAKER_FEE_BPS=0
+VOL_K=0.45
+TOX_MULT=1.4
+USE_MICRO=1
+PENNY=1
+AGGRESSIVE_TOUCH=1
+# ===== INVENTORY / EXITS =====
+ENABLE_SMART_INVENTORY_MGMT=1
+EXIT_MIN_PROFIT_BPS=0
+MAX_HOLD_S=45
+STRESS_LOSS_BPS=5
+EMERGENCY_TAKER_LOSS_BPS=4
+EMERGENCY_TAKER_SCORE_THRESHOLD=1.8
+TAKER_FEE_BPS=2.2
+TAKER_SLIP_BPS=5
+TAKER_FILL_PRICE_MODE=est
+# ---- TAKER FEE BUTTON ----
+# ENABLE_TAKER_EXITS=0 : never pay taker fees on exits. Losing positions are exited with post-only, reduce-only
+#                        maker orders joined at the best bid (cover short) / best ask (exit long) and chased as the touch moves.
+# ENABLE_TAKER_EXITS=1 : old behaviour (IOC taker). With MAKER_EXIT_FIRST=1 the bot first tries the aggressive maker exit when
+#                        the loss is within STRESS_LOSS_BPS+MAKER_EXIT_SLACK_BPS or the touch fill probability >= MAKER_EXIT_MIN_PROB.
+# TAKER_HARD_STOP_BPS  : catastrophe stop. Even with takers off, a loss this large (bps) forces a taker exit. 0 = never.
+ENABLE_TAKER_EXITS=0
+MAKER_EXIT_FIRST=1
+MAKER_EXIT_SLACK_BPS=2.0
+MAKER_EXIT_MIN_PROB=0.55
+TAKER_HARD_STOP_BPS=15
+# Early adverse-OBI exit
+ADV_OBI_EXIT=1
+ADV_OBI_THRESH=0.80
+ADV_OBI_SECS=4
+ADV_OBI_LOSS_BPS=2
+# ===== FLOW DEFENSE =====
+TREND_WINDOW_S=5
+TREND_PULL_BPS=3
+TREND_WIDEN=1
+TREND_HOLD_S=4
+VOL_WINDOW_S=5
+VOL_PAUSE_BPS=12
+JUMP_BPS=6
+JUMP_COOLDOWN_S=2
+BURST_FILLS=2
+BURST_WINDOW_S=15
+BURST_COOLDOWN_S=15
+SWEEP_GUARD_FILLS=2
+SWEEP_GUARD_WINDOW_S=1
+MARKOUT_HORIZON_S=5
+MARKOUT_WINDOW=10
+# Stop ADDING in the first 15 min after the US open (ET). Unwinds still run.
+# Bot's own ET clock (does not depend on the exchange's isOutsideRth flag). Wraps midnight. Blocks ADDING only.
+ET_PAUSE_WINDOWS=16:00-09:45
+# Quote only when expected value is clearly positive (0 = quote everything)
+MIN_EV_BPS=0.1
+ENABLE_ADAPTIVE_EV=1
+# ===== ORDERBOOK INTEL =====
+ENABLE_ORDERBOOK_INTEL=1
+OBI_ALPHA=1.0
+TFI_BETA=1.5
+FILL_PROB_KAPPA=0.25
+GAMMA_RISK_AVERSION=0.25
+# ===== SELECTIVE / QUEUE / FRAGILITY =====
+ENABLE_SELECTIVE_TOUCH=1
+ENABLE_QUEUE_MODEL=1
+QUEUE_HORIZON_S=2
+ENABLE_FRAGILITY_GUARD=1
+FRAGILITY_THRESHOLD=0.70
+ENABLE_EXHAUSTION_DETECTION=0
+QUEUE_RESET_COST_BPS=0.20
+ENABLE_ABSORPTION_MODE=0
+ENABLE_ONESIDED_TOUCH=1
+EV_HYSTERESIS_BPS=0.10
+# ===== MARKET INFO / ORACLE =====
+# markPrice + isOutsideRth were read once at startup; now refreshed every N seconds.
+MARKET_REFRESH_S=5
+# Hypothesis, OFF until STATUS mark_dev is shown to lead the mid: stop ADDING on the side that trades against the oracle.
+ORACLE_GUARD=0
+ORACLE_GUARD_BPS=3.0
+# ===== OWN ORDER HANDLING =====
+# Remove our own resting orders from OBI / micro-price / queue / fragility / depth / taker book-walk.
+EXCLUDE_OWN_ORDERS=1
+OWN_ORDER_MIN_AGE_S=0.25
+# ===== DYNAMIC SIZING (adding quotes only) =====
+ENABLE_DYNAMIC_SIZING=1
+DYN_SIZE_MIN=0.35
+DYN_INV_CAP_FRAC=0.55
+DYN_INV_MIN=0.20
+DYN_EDGE_REF_BPS=0.35
+DYN_EDGE_MIN_N=3
+DYN_WARMUP_MULT=0.75
+DYN_VOL_REF_BPS=2.5
+DYN_DD_WEIGHT=0.8
+# ===== DEPTH IMBALANCE =====
+USE_DEPTH_IMBALANCE=1
+IMBALANCE_LEVELS=6
+IMBALANCE_WIDEN_BPS=3
+IMBALANCE_SIZE_CUT=0.25
+CONTINUE_ADD_AFTER_REDUCE=1
+# ===== LEARNING / LOGGING (NEW files: the old learned state came from the bleeding off-hours session) =====
+ENABLE_ONLINE_LEARNING=1
+LEARNING_STATE_PATH=nvda_rth_state.json
+REGIME_VOL_THRESHOLD_BPS=8.0
+REGIME_FLOW_THRESHOLD=0.35
+REGIME_TOXIC_THRESHOLD_BPS=3.0
+REGIME_TOXIC_SPREAD_MULT=1.5
+ENABLE_QUOTE_DATASET=1
+QUOTE_DATASET_PATH=nvda_rth_quotes.jsonl
+ENABLE_EMPIRICAL_LEARNER=1
+EMPIRICAL_PRIOR_WEIGHT=5
+JOURNAL_PATH=nvda_rth_journal.jsonl
+# ===== EXECUTION / LIMITS =====
+HALT_EXIT=1
+# Dead man's switch: the exchange allows only 10 FIRINGS per UTC day. It fires whenever the bot stops refreshing for DMS_TTL_S
+# (restart, crash, stall, network timeout). 30s is too tight; 120s still pulls orders within 2 min of a real crash.
+DMS_ENABLED=1
+DMS_TTL_S=120
+DMS_REQUIRED=0
+# On the daily loss limit: stop ADDING until 00:00 UTC; unwinds continue.
+SESSION_LOSS_ACTION=pause_day
+SESSION_MAX_LOSS_USD=2
+LOG_FILE=bot.log
+LOG_MAX_MB=20
+LOG_BACKUPS=10
+QUOTE_DATASET_MIN_S=1.0
+QUOTE_DATASET_MAX_MB=200
+REQUOTE_BPS=1
+RETREAT_BPS=0.4
+MIN_REQUOTE_S=1
+MAX_ACTIONS_PER_MIN=1035
+LOOP_S=0.25
+HEARTBEAT_S=5
+RECONCILE_S=5
+STATUS_S=10
+STALE_S=5
+MAX_MARKET_SPREAD_BPS=50
+MAX_ORACLE_DEV_BPS=100
+# ===== CROSS EXCHANGE =====
+ENABLE_CROSS_EXCHANGE=0
+CROSS_LEAD_LAG_WEIGHT=0.5
+CROSS_DISPERSION_WIDEN_MULT=1.5
+CROSS_VELOCITY_THRESHOLD_BPS=1.5
