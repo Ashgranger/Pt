@@ -598,6 +598,39 @@ class TestLevel7MarketMaker(unittest.IsolatedAsyncioTestCase):
                         "dust must be treated as flat -> normal two-sided quoting")
         self.assertFalse([o for o in bot.om.orders.values() if o.is_taker], "no taker exit for dust")
 
+    async def test_28_taker_exit_switch_and_aggressive_maker_exit(self):
+        async def run(**env):
+            base = dict(EXTRA_LEVELS=0, ORDER_USD=20, MAX_POSITION_USD=100, EXIT_MIN_PROFIT_BPS="1.5",
+                        ENABLE_SMART_INVENTORY_MGMT=1, MIN_REQUOTE_S="0.1", EMERGENCY_TAKER_LOSS_BPS="6.0")
+            base.update(env)
+            bot, s, clock = sim.make(**base)
+            await sim.step(bot, s, clock, "80000.0", "80080.0")
+            s.taker(SELL)
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            clock.t += 0.5
+            s.push_trade(SELL, "2.0", "79900.0")
+            await sim.step(bot, s, clock, "79900.0", "79920.0", bsz="0.1", asz="2.0")
+            takers = [f for f in bot.ledger.fills if f.side == SELL and f.price <= D("79900.5")]
+            live = [o for o in bot.om.orders.values() if not o.is_taker and o.side == SELL]
+            return bot, takers, live
+        # 1) default: taker exit still works (position flattened immediately)
+        bot, _, _ = await run()
+        self.assertEqual(bot.ledger.position, D(0))
+        # 2) button off: no taker; a post-only reduce-only SELL sits at the best ask
+        bot, _, live = await run(ENABLE_TAKER_EXITS="0")
+        self.assertNotEqual(bot.ledger.position, D(0), "no taker exit when disabled")
+        self.assertTrue(live, "aggressive maker exit must be resting")
+        self.assertTrue(all(o.price == D("79920.0") for o in live), [str(o.price) for o in live])
+        self.assertTrue(all(getattr(o, "is_reduce_only", False) for o in live))
+        # 3) disabled but catastrophe hard stop reached (loss ~11bps >= 5) -> taker allowed
+        bot, _, _ = await run(ENABLE_TAKER_EXITS="0", TAKER_HARD_STOP_BPS="5")
+        self.assertEqual(bot.ledger.position, D(0))
+        # 4) maker-first: loss within stress+slack -> maker, no taker
+        bot, _, live = await run(MAKER_EXIT_FIRST="1", STRESS_LOSS_BPS="20", MAKER_EXIT_SLACK_BPS="2")
+        self.assertNotEqual(bot.ledger.position, D(0))
+        self.assertTrue(live)
+
     async def test_16_emergency_taker_cut_on_adverse_cascade(self):
         """Test Emergency Taker Cut: When adverse loss and flow exceed threshold, bot fires IOC taker order to cut loss."""
         bot, s, clock = sim.make(EXTRA_LEVELS=0, ORDER_USD=20, MAX_POSITION_USD=100,

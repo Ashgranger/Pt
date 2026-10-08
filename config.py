@@ -146,6 +146,11 @@ class Config:
     adv_obi_exit: bool
     exclude_own_orders: bool
     market_refresh_s: float
+    enable_taker_exits: bool
+    maker_exit_first: bool
+    maker_exit_slack_bps: Decimal
+    maker_exit_min_prob: float
+    taker_hard_stop_bps: Decimal
     oracle_guard: bool
     oracle_guard_bps: Decimal
     enable_dynamic_sizing: bool
@@ -311,6 +316,11 @@ class Config:
             adv_obi_exit=_b("ADV_OBI_EXIT", "0"),
             exclude_own_orders=_b("EXCLUDE_OWN_ORDERS", "0"),
             market_refresh_s=float(_e("MARKET_REFRESH_S", "5")),
+            enable_taker_exits=_b("ENABLE_TAKER_EXITS", "1"),
+            maker_exit_first=_b("MAKER_EXIT_FIRST", "0"),
+            maker_exit_slack_bps=_d("MAKER_EXIT_SLACK_BPS", "2.0"),
+            maker_exit_min_prob=float(_e("MAKER_EXIT_MIN_PROB", "0.55")),
+            taker_hard_stop_bps=_d("TAKER_HARD_STOP_BPS", "0"),
             oracle_guard=_b("ORACLE_GUARD", "0"),
             oracle_guard_bps=_d("ORACLE_GUARD_BPS", "3.0"),
             enable_dynamic_sizing=_b("ENABLE_DYNAMIC_SIZING", "0"),

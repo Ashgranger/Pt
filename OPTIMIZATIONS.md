@@ -80,3 +80,9 @@ Optional extra speed:  pip install uvloop orjson
 ## Dust-position lock (10-07 17:08 log)
 - A leftover position of 0.0000052 sh (below the exchange min order size, ~$0.001) was treated as a real long: engine went into UNWIND mode, computed unreal -7bps from a stale avg_cost, fired stress_loss every second, but qty < min_size so no exit order could ever be sent, and normal quoting was suppressed ("orders: none").
 - Fix: positions smaller than the market's min order size are treated as flat (engine + RTH pause); TAKER_WHY only logs when a taker order can really be placed. Test: test_27 (fails without the fix).
+
+## Taker-fee button (ENABLE_TAKER_EXITS=1/0)
+- Every taker-exit rule now goes through _exit_style(): taker only if ENABLE_TAKER_EXITS=1 or loss >= TAKER_HARD_STOP_BPS (0=off). Otherwise an aggressive maker exit (ALO, reduce-only) is quoted at the best bid/ask and chased.
+- MAKER_EXIT_FIRST=1 (with takers enabled): maker first when loss <= STRESS_LOSS_BPS + MAKER_EXIT_SLACK_BPS or queue fill prob >= MAKER_EXIT_MIN_PROB; taker only beyond that.
+- Log: EXIT_STYLE <side> -> MAKER|TAKER (<why>) rule=... Test: test_28. Note: tests that assert taker behaviour fail if you export ENABLE_TAKER_EXITS=0 globally (expected).
+- Trade-off: a maker exit can sit unfilled while price keeps running; that is what TAKER_HARD_STOP_BPS is for.

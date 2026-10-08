@@ -196,6 +196,39 @@ class MarketMakingEngine:
         st[key] = (since, now)
         return now - since
 
+    def _exit_style(self, side: str, loss_bps: Decimal, md: MarketData, now: float, ledger: Ledger):
+        """Decide how to get out when a taker-exit rule fires. Returns ("taker"|"maker", reason).
+        taker allowed only if ENABLE_TAKER_EXITS=1 or the loss reached TAKER_HARD_STOP_BPS (catastrophe stop, 0=off).
+        maker (post-only, reduce-only, joined at the best bid/ask) is used when
+          - taker exits are disabled, or
+          - MAKER_EXIT_FIRST=1 and (loss is only MAKER_EXIT_SLACK_BPS beyond the stress stop, or the touch is likely to fill).
+        """
+        cfg = self.cfg
+        hard = cfg.taker_hard_stop_bps > ZERO and loss_bps >= cfg.taker_hard_stop_bps
+        if hard:
+            return ("taker", "hard_stop")
+        if not cfg.enable_taker_exits:
+            return ("maker", "taker_disabled")
+        if not cfg.maker_exit_first:
+            return ("taker", "default")
+        if loss_bps <= cfg.stress_loss_bps + cfg.maker_exit_slack_bps:
+            return ("maker", "slightly_beyond_stop")
+        try:
+            px = md.bid if side == BUY else md.ask          # BUY covers a short at the best bid; SELL exits a long at the best ask
+            p = self.queue_fill_probability(side, px, md, now, horizon_s=cfg.queue_horizon_s, ledger=ledger)
+            if p >= cfg.maker_exit_min_prob:
+                return ("maker", "high_fill_prob=%.2f" % p)
+        except Exception:
+            pass
+        return ("taker", "loss_beyond_slack_low_fill_prob")
+
+    def _log_exit_style(self, side, style, why, rule, loss_bps) -> None:
+        t = time.time()
+        if t - getattr(self, "_last_exit_style_ts", 0.0) < 1.0:
+            return
+        self._last_exit_style_ts = t
+        log.info("EXIT_STYLE %s -> %s (%s) rule=%s loss=%.2fbps", side, style.upper(), why, rule, float(loss_bps))
+
     def _log_taker_why(self, side, why, unreal_bps, emerg_loss_bps, adv_score, pos_ratio, mid, ledger) -> None:
         t = time.time()
         if t - getattr(self, "_last_why_ts", 0.0) < 1.0:
@@ -507,6 +540,13 @@ class MarketMakingEngine:
                             trigger_taker = True
                             taker_why = "adverse_obi_persist"
 
+                    force_touch_exit = False
+                    if trigger_taker and qty >= m.min_size:
+                        style, style_why = self._exit_style(BUY, -unreal_bps, md, now, ledger)
+                        self._log_exit_style(BUY, style, style_why, taker_why, -unreal_bps)
+                        if style != "taker":
+                            trigger_taker = False
+                            force_touch_exit = True
                     if trigger_taker and qty >= m.min_size:
                         self._log_taker_why("BUY", taker_why, unreal_bps, emerg_loss_bps, adv_score, pos_ratio, mid, ledger)
                     if trigger_taker and md.ask and qty >= m.min_size:
@@ -535,10 +575,10 @@ class MarketMakingEngine:
 
                         scratch_hold_thresh = min(max_hold * 0.4, 25.0)
                         is_scratch_time = (hold_time > scratch_hold_thresh)
-                        should_maker_scratch = self.cfg.enable_smart_inventory_mgmt and (has_adverse_flow or pos_ratio >= Decimal("0.60") or is_stressed or is_scratch_time or unreal_bps < -Decimal("1.5"))
+                        should_maker_scratch = self.cfg.enable_smart_inventory_mgmt and (force_touch_exit or has_adverse_flow or pos_ratio >= Decimal("0.60") or is_stressed or is_scratch_time or unreal_bps < -Decimal("1.5"))
 
                         if should_maker_scratch:
-                            if severe_buy_pressure or is_stressed or pos_ratio >= Decimal("0.85") or unreal_bps < -Decimal("1.5"):
+                            if force_touch_exit or severe_buy_pressure or is_stressed or pos_ratio >= Decimal("0.85") or unreal_bps < -Decimal("1.5"):
                                 cand_px = md.bid
                                 if self.cfg.penny and (md.ask - md.bid) > Decimal("2") * tick and (md.bid + tick) <= breakeven_px:
                                     cand_px = md.bid + tick
@@ -736,6 +776,13 @@ class MarketMakingEngine:
                             trigger_taker = True
                             taker_why = "adverse_obi_persist"
 
+                    force_touch_exit = False
+                    if trigger_taker and qty >= m.min_size:
+                        style, style_why = self._exit_style(SELL, -unreal_bps, md, now, ledger)
+                        self._log_exit_style(SELL, style, style_why, taker_why, -unreal_bps)
+                        if style != "taker":
+                            trigger_taker = False
+                            force_touch_exit = True
                     if trigger_taker and qty >= m.min_size:
                         self._log_taker_why("SELL", taker_why, unreal_bps, emerg_loss_bps, adv_score, pos_ratio, mid, ledger)
                     if trigger_taker and md.bid and qty >= m.min_size:
@@ -764,10 +811,10 @@ class MarketMakingEngine:
 
                         scratch_hold_thresh = min(max_hold * 0.4, 25.0)
                         is_scratch_time = (hold_time > scratch_hold_thresh)
-                        should_maker_scratch = self.cfg.enable_smart_inventory_mgmt and (has_adverse_flow or pos_ratio >= Decimal("0.60") or is_stressed or is_scratch_time or unreal_bps < -Decimal("1.5"))
+                        should_maker_scratch = self.cfg.enable_smart_inventory_mgmt and (force_touch_exit or has_adverse_flow or pos_ratio >= Decimal("0.60") or is_stressed or is_scratch_time or unreal_bps < -Decimal("1.5"))
 
                         if should_maker_scratch:
-                            if severe_sell_pressure or is_stressed or pos_ratio >= Decimal("0.85") or unreal_bps < -Decimal("1.5"):
+                            if force_touch_exit or severe_sell_pressure or is_stressed or pos_ratio >= Decimal("0.85") or unreal_bps < -Decimal("1.5"):
                                 cand_px = md.ask
                                 if self.cfg.penny and (md.ask - md.bid) > Decimal("2") * tick and (md.ask - tick) >= breakeven_px:
                                     cand_px = md.ask - tick
