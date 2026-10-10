@@ -80,6 +80,20 @@ class MarketMaker:
         self.cfg = cfg
         self.now = time.monotonic
         self.stop_evt = asyncio.Event()
+        self.restart_requested = False
+        self._pos_seq = -1
+        self._resync_req = False
+        self._last_pos_resync = 0.0
+        self._ro_n = 0
+        self._ro_first = 0.0
+        self._ro_fill_ts = None
+        self._ro_fix_ts = 0.0
+        self._ro_stage = 0
+        self._idle_since = None
+        self._tick_quote_path = False
+        self._tick_paused_cfg = False
+        self._last_blocked = (False, False)
+        self._last_targets_n = 0
 
         self.ex = Exchange(cfg, self._on_channel)
         self.md = MarketData(cfg)
@@ -91,6 +105,8 @@ class MarketMaker:
         self._pnl_base = ZERO
         self.engine = MarketMakingEngine(cfg)
         self.om = OrderManager(cfg, self.ex, self.signer, self._get_market, self._on_fill)
+        self.om.on_reduce_only_reject = self._on_reduce_only_reject
+        self.ex.on_degraded = lambda: setattr(self, '_resync_req', True)
 
         self._recent_fills: deque = deque()
         self._burst_blocked_until = {BUY: 0.0, SELL: 0.0}
@@ -174,16 +190,36 @@ class MarketMaker:
             self._dirty_evt.set()
 
         elif channel == "positions":
-            rows = extract_positions(contents)
             m = self.md.info
             if m:
                 target_mid = self.md.mid or m.mark
-                for r in rows:
-                    if int(r.get("marketId", -1)) == m.market_id:
-                        side = str(r.get("side", "FLAT")).upper()
-                        sz = Decimal(str(r.get("size", "0")))
-                        signed_pos = sz if side == "LONG" else (-sz if side == "SHORT" else ZERO)
-                        self.ledger.reconcile(signed_pos, now, target_mid, m.min_notional)
+                rows = [r for r in extract_positions(contents) if int(r.get("marketId", -1)) == m.market_id]
+                seq_in = contents.get("lastSequenceId") if isinstance(contents, dict) else None
+                try:
+                    seq_in = int(seq_in) if seq_in is not None else None
+                except (TypeError, ValueError):
+                    seq_in = None
+                if is_snapshot:
+                    self._pos_seq = seq_in if seq_in is not None else -1       # snapshot = new baseline
+                elif seq_in is not None:
+                    if seq_in < self._pos_seq:
+                        return                                                  # stale/out-of-order delta
+                    self._pos_seq = seq_in
+                if rows:
+                    r = rows[0]
+                    side = str(r.get("side", "FLAT")).upper()
+                    sz = Decimal(str(r.get("size", "0")))
+                    # size is already SIGNED (+long/-short) on Arcus; abs() by side makes this right for either form
+                    # (it used to be negated twice, booking every short as a long).
+                    ex_pos = abs(sz) if side in ("LONG", "BUY") else (-abs(sz) if side in ("SHORT", "SELL") else ZERO)
+                elif is_snapshot:
+                    ex_pos = ZERO        # a snapshot omits flat markets: no row == flat (this never cleared stale longs before)
+                else:
+                    return
+                if is_snapshot:
+                    self._apply_exchange_position(ex_pos, now, target_mid, m, "snapshot")
+                else:
+                    self.ledger.reconcile(ex_pos, now, target_mid, m.min_notional)
 
         elif channel in ("funding", "funding_rate", "fundingRate"):
             if isinstance(contents, dict):
@@ -382,6 +418,7 @@ class MarketMaker:
     async def tick(self) -> None:
         async with self._tick_lock:
             now = self.now()
+            self._tick_quote_path = False
             self.ledger.last_now = now
             self.ledger.current_now = now
             if hasattr(self.ledger, "learner") and (now - getattr(self, "_last_decay_call", 0.0) >= 1.0):
@@ -523,10 +560,15 @@ class MarketMaker:
                     self._last_pause_log["oguard"] = now
                     log.info("ORACLE_GUARD mark_dev=%+.2fbps -> blocking %s adds", float(dev), "SELL" if dev > 0 else "BUY")
 
+            self._tick_quote_path = True
+            self._tick_paused_cfg = bool(getattr(self, "_loss_pause_until", 0.0) or getattr(self, "_rth_unwind_only", False)
+                                         or in_et_windows(self.cfg.et_pause_windows, time.time()))
+            self._last_blocked = (buy_blocked, sell_blocked)
             existing_slots = set(self.om.pair_slots.keys())
             targets = self.engine.generate_ladder_quotes(
                 m, self.md, self.ledger, now, buy_blocked, sell_blocked, existing_slots=existing_slots
             )
+            self._last_targets_n = len(targets)
             self._log_quote_opportunity(targets, now)
 
             blocked_sides = set()
@@ -535,6 +577,122 @@ class MarketMaker:
             if sell_blocked:
                 blocked_sides.add(SELL)
             await self.om.sync_quotes(targets, now, blocked_sides=blocked_sides)
+
+    def _apply_exchange_position(self, ex_pos: Decimal, now: float, mid: Decimal, m, src: str) -> bool:
+        """Adopt an authoritative exchange position immediately (snapshot / REST), unless a fill is still in flight."""
+        tol = (m.min_notional / mid) * Decimal("0.25") if mid else Decimal("1e-8")
+        if abs(ex_pos - self.ledger.position) <= tol:
+            self.ledger._mismatch = 0
+            return False
+        if now - self.ledger.last_fill_ts < 3.0:
+            self._resync_req = True          # a fill just landed - re-check over REST in a moment
+            return False
+        log.warning("POSITION RESYNC (%s): local %s -> exchange %s", src, fmt(self.ledger.position), fmt(ex_pos))
+        self.ledger.force_position(ex_pos, now, mid, m.min_notional)
+        self._dirty_evt.set()
+        return True
+
+    async def _resync_position(self, reason: str, confirm: bool = True) -> Optional[bool]:
+        """REST ground truth. Returns True if corrected, False if already in sync, None if REST unavailable."""
+        m = self.md.info
+        if not m:
+            return None
+        self._last_pos_resync = self.now()
+        a = await self.ex.fetch_position(self.cfg.address, self.cfg.account_index, m.market_id)
+        if a is None:
+            return None
+        mid = self.md.mid or m.mark
+        tol = (m.min_notional / mid) * Decimal("0.25") if mid else Decimal("1e-8")
+        if abs(a - self.ledger.position) <= tol:
+            return False
+        if confirm:                       # guard against reading REST a hair before/after a WS fill
+            await asyncio.sleep(1.0)
+            b = await self.ex.fetch_position(self.cfg.address, self.cfg.account_index, m.market_id)
+            if b is None or abs(b - a) > tol:
+                return None
+            a = b
+        return self._apply_exchange_position(a, self.now(), mid, m, "REST/" + reason)
+
+    async def _pos_resync_loop(self, now: float) -> None:
+        S = float(getattr(self.cfg, "pos_resync_s", 0.0) or 0.0)
+        due = S > 0 and (now - self._last_pos_resync) >= S
+        if not (due or self._resync_req):
+            return
+        self._resync_req = False
+        try:
+            await self._resync_position("periodic")
+        except Exception:
+            log.exception("position resync failed")
+
+    def _on_reduce_only_reject(self, side: str, now: float) -> None:
+        """Exchange rejected our reduce-only order with REDUCE_ONLY_WOULD_INCREASE: it says that order would GROW the
+        exchange position, i.e. the exchange is flat or on the other side. If our local book position disagrees we are
+        desynced (missed fill / bad snapshot) and would otherwise retry the same doomed unwind forever until restart."""
+        pos = self.ledger.position
+        if pos == ZERO or not ((side == SELL and pos > ZERO) or (side == BUY and pos < ZERO)):
+            return
+        fill_ts = getattr(self.ledger, "last_fill_ts", None)
+        if self._ro_fill_ts != fill_ts or now - self._ro_first > 60.0 or self._ro_n == 0:
+            self._ro_n, self._ro_first, self._ro_fill_ts = 0, now, fill_ts
+        self._ro_n += 1
+        if self._ro_n < 3:
+            return
+        n, self._ro_n = self._ro_n, 0
+        asyncio.create_task(self._ro_repair(side, now, n))
+
+    async def _ro_repair(self, side: str, now: float, n: int = 3) -> None:
+        r = None
+        try:
+            r = await self._resync_position("reduce-only rejects", confirm=False)
+        except Exception:
+            log.exception("reduce-only REST repair failed")
+        if r is not None:                    # REST answered: either corrected, or local already agrees with exchange
+            return
+        m = self.md.info
+        mid = self.md.mid or (m.mark if m else None)
+        pos = self.ledger.position
+        if not m or not mid or pos == ZERO:
+            return
+        if now - self._ro_fix_ts > 120.0:
+            self._ro_stage = 0
+        if self._ro_stage == 0:
+            new_pos, how = -pos, "mirrored (sign error)"
+        else:
+            new_pos, how = ZERO, "set flat (exchange is flat)"
+        log.error("POSITION DESYNC (REST unavailable): %d reduce-only %s orders rejected while local pos=%s -> local position %s to %s",
+                  n, side, fmt(pos), how, fmt(new_pos))
+        self.ledger.force_position(new_pos, now, mid, m.min_notional)
+        self._ro_stage += 1
+        self._ro_fix_ts = now
+        self._dirty_evt.set()
+
+    def _stall_check(self, now: float) -> None:
+        """Self-heal: if the bot is flat, has no resting orders and is NOT intentionally paused, yet has not
+        been able to quote for STALL_RESTART_S, restart the process in place (same effect as a manual restart,
+        which is the only thing that has cleared this stall). Normal gaps between orders are <5 min."""
+        S = float(getattr(self.cfg, "stall_restart_s", 0.0) or 0.0)
+        m = self.md.info
+        if S <= 0 or not m or self.restart_requested:
+            return
+        busy = (not self._tick_quote_path) or self._tick_paused_cfg or bool(self.om.orders) \
+            or abs(self.ledger.position) >= m.min_size
+        if busy or self._idle_since is None:
+            self._idle_since = now
+            return
+        if now - self._idle_since < S:
+            return
+        try:
+            regime = self.md.detect_regime(now, self.ledger.tox_bps)
+            l = self.ledger.learner if hasattr(self.ledger, "learner") else None
+            pm = (float(l.predict_markout(BUY, regime, 0, self.cfg.queue_horizon_s)),
+                  float(l.predict_markout(SELL, regime, 0, self.cfg.queue_horizon_s))) if l else None
+        except Exception:
+            regime, pm = "?", None
+        log.error("STALL WATCHDOG: flat, no resting orders and quoting allowed for %.0fs (blocked buy/sell=%s, last targets=%d, "
+                  "regime=%s, pred_markout buy/sell=%s) - restarting process to clear stuck in-memory state",
+                  now - self._idle_since, self._last_blocked, self._last_targets_n, regime, pm)
+        self.restart_requested = True
+        self.stop_evt.set()
 
     async def _heartbeat(self, now: float) -> None:
         """Arm/refresh the exchange-side dead man's switch (scheduleCancel) for our market."""
@@ -749,13 +907,17 @@ class MarketMaker:
                 log.info("Connecting to Arcus WebSocket (%s)...", self.ex.ws_url)
                 async with websockets.connect(
                     self.ex.ws_url,
-                    ping_interval=15,
-                    ping_timeout=20,
+                    ping_interval=self.cfg.ws_ping_interval_s,
+                    ping_timeout=self.cfg.ws_ping_timeout_s,
+                    open_timeout=20,
                     max_size=2**23,
                     close_timeout=5,
                     compression=None
                 ) as ws:
                     self.ex.ws = ws
+                    self.ex.last_rx = time.monotonic()
+                    self._pos_seq = -1
+                    self.ledger._mismatch = 0
                     reader_task = asyncio.create_task(self.ex.reader())
 
                     await self.ex.subscribe("bbo", self.cfg.market)
@@ -772,16 +934,30 @@ class MarketMaker:
                     if self.om.maybe_orders:
                         await self.om.cancel_all()
 
+                    # We may have been blind (resting orders keep resting on disconnect - no cancel-on-disconnect).
+                    # Settle our position against REST truth BEFORE quoting again.
+                    try:
+                        await asyncio.sleep(1.0)       # let the market info + position snapshots land
+                        r = await asyncio.wait_for(self._resync_position("reconnect"), timeout=12.0)
+                        log.info("Reconnect position check: %s", {True: "corrected", False: "in sync", None: "REST unavailable"}[r])
+                    except Exception as e:
+                        log.warning("Reconnect position check failed: %s", e)
                     log.info("Subscribed to data feeds. Level 7 MM Engine active.")
 
                     while not self.stop_evt.is_set() and self.ex.is_connected:
                         now = self.now()
                         self._spawn_bg("heartbeat", self._heartbeat, now)
                         self._spawn_bg("reconcile", self._reconcile, now)
+                        self._spawn_bg("posresync", self._pos_resync_loop, now)
+                        if time.monotonic() - self.ex.last_rx > self.cfg.ws_stale_s:
+                            log.warning("No WebSocket frame for %.0fs - forcing reconnect", time.monotonic() - self.ex.last_rx)
+                            await ws.close()
+                            break
                         self._spawn_bg("mktinfo", self._refresh_market_info, now)
                         self._status_log(now)
 
                         await self.tick()
+                        self._stall_check(self.now())
 
                         try:
                             await asyncio.wait_for(self._dirty_evt.wait(), timeout=self.cfg.loop_s)

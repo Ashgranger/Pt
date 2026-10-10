@@ -5,7 +5,9 @@ import asyncio
 import itertools
 import json
 import logging
+import time
 import urllib.request
+from decimal import Decimal
 from typing import Any, Callable, Optional
 
 from config import ENVS, Config
@@ -38,6 +40,8 @@ class Exchange:
         self._ids = itertools.count(1)
         self._pending: dict[int, asyncio.Future] = {}
         self._dry_seq = itertools.count(1)
+        self.last_rx = time.monotonic()
+        self.on_degraded: Optional[Callable[[], None]] = None
 
     @property
     def is_connected(self) -> bool:
@@ -99,6 +103,7 @@ class Exchange:
         return await self._send({"type": "subscribe", "channel": channel, "id": sub_id, **extra})
 
     def handle_message(self, raw) -> None:
+        self.last_rx = time.monotonic()
         try:
             msg = _loads(raw)
         except ValueError:
@@ -118,6 +123,11 @@ class Exchange:
             return
         if mtype in ("error", "degraded") or "error" in msg:
             log.warning("server message: %s", str(raw)[:300])
+        if mtype == "degraded" and self.on_degraded:
+            try:
+                self.on_degraded()
+            except Exception:
+                log.exception("on_degraded failed")
 
     async def reader(self) -> None:
         try:
@@ -132,6 +142,37 @@ class Exchange:
         finally:
             self._fail_all_pending("CONNECTION_CLOSED")
             self.ws = None
+
+    async def fetch_position(self, address: str, account_index: int, market_id: int) -> Optional[Decimal]:
+        """Authoritative position over REST (GET /v1/positions, weight 2, independent of the WebSocket).
+        `size` is SIGNED (+long / -short) per the Arcus API; a market with no row is flat. None = lookup failed."""
+        if self.cfg.dry_run:
+            return None
+
+        def _get():
+            from urllib.parse import urlencode
+            q = urlencode({"address": address, "accountIndex": account_index, "market": market_id})
+            with urllib.request.urlopen(f"{self.rest}/v1/positions?{q}", timeout=6) as r:
+                return json.loads(r.read())
+
+        try:
+            data = await asyncio.to_thread(_get)
+        except Exception as e:
+            log.warning("REST positions lookup failed: %s", e)
+            return None
+        rows = data.get("positions") if isinstance(data, dict) else None
+        if isinstance(rows, dict):
+            rows = list(rows.values())
+        for r in rows or []:
+            if isinstance(r, dict) and int(r.get("marketId", -1)) == int(market_id):
+                side = str(r.get("side", "")).upper()
+                sz = Decimal(str(r.get("size", "0")))
+                if side == "LONG":
+                    return abs(sz)
+                if side == "SHORT":
+                    return -abs(sz)
+                return sz
+        return Decimal("0")
 
     async def fetch_markets(self, market: Optional[str] = None) -> list:
         def _get():

@@ -36,9 +36,14 @@ class ConditionalMarkoutModel:
     """Empirical Bayesian conditional markout prediction model.
     Learns E[markout | side, regime, level, horizon] with shrinkage toward prior.
     """
-    def __init__(self, prior_weight: int = 5):
+    def __init__(self, prior_weight: int = 5, ttl_s: float = 3600.0):
         self.prior_weight = prior_weight
+        # Samples older than ttl_s are ignored. Without this, a run of adverse fills makes the predicted
+        # markout negative -> EV < MIN_EV -> bot stops quoting -> no new fills -> the stale samples can
+        # never be replaced, so quoting stays dead until the process is restarted.
+        self.ttl_s = float(ttl_s)
         self.history: dict[tuple, list[float]] = {}
+        self.stamps: dict[tuple, list[float]] = {}
         self.priors = {
             ("BUY", "REGIME_A_QUIET", 0): Decimal("0.5"),
             ("SELL", "REGIME_A_QUIET", 0): Decimal("0.5"),
@@ -55,12 +60,25 @@ class ConditionalMarkoutModel:
         if key not in self.history:
             self.history[key] = []
         self.history[key].append(markout_bps)
+        st = self.stamps.setdefault(key, [])
+        while len(st) < len(self.history[key]) - 1:      # history filled directly (tests/old state): treat as fresh
+            st.append(time.time())
+        st.append(time.time())
         if len(self.history[key]) > 100:
             self.history[key].pop(0)
+            st.pop(0)
 
     def predict(self, side: str, regime: str, level: int, horizon: float = 2.0) -> Decimal:
         key = (side, regime, level, round(horizon, 1))
         samples = self.history.get(key, [])
+        st = self.stamps.get(key, [])
+        # Only a key that has received NO new sample for ttl_s is reset to its prior (== what a restart does).
+        # While fills keep arriving the full history is used exactly as before, so protection against
+        # genuinely toxic flow is unchanged.
+        if samples and self.ttl_s > 0 and st and (time.time() - st[-1]) > self.ttl_s:
+            self.history[key] = []
+            self.stamps[key] = []
+            samples = []
         prior = self.priors.get((side, regime, level), Decimal("0.0"))
 
         n = len(samples)
@@ -110,7 +128,8 @@ class OnlineLearner:
         self._last_decay_ts: Optional[float] = None
         self._last_feedback_ts: float = 0.0
         self._uncommitted_updates: int = 0
-        self.markout_model = ConditionalMarkoutModel(prior_weight=int(getattr(cfg, "empirical_prior_weight", 5)))
+        self.markout_model = ConditionalMarkoutModel(prior_weight=int(getattr(cfg, "empirical_prior_weight", 5)),
+                                                     ttl_s=float(getattr(cfg, "markout_model_ttl_s", 3600.0)))
 
         # Hard mathematical & safety bounds [min_val, max_val]
         self.bounds = {
@@ -812,6 +831,13 @@ class Ledger:
             return self.tox_bps
         avg_m = self._calc_weighted_markout(buf)
         return max(ZERO, -avg_m)
+
+    def force_position(self, new_pos: Decimal, now: float, mid: Decimal, min_notional: Decimal) -> None:
+        """Overwrite the local position (desync repair). Resets cost basis to mid so unwind logic starts clean."""
+        self.position = new_pos
+        self.avg_cost = mid
+        self._mismatch = 0
+        self.opened_ts = None if self.is_flat(mid, min_notional) else now
 
     def reconcile(self, ex_pos: Decimal, now: float, mid: Decimal, min_notional: Decimal) -> bool:
         tol = (min_notional / mid) * Decimal("0.25") if mid else Decimal("1e-8")

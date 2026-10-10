@@ -404,6 +404,13 @@ class OrderManager:
                 self._backoff(o.side, now)
             log.info("ORDER L%d %s %s %s", o.pair_index, o.side, state or status, reason)
             self._remove_order(o.order_id)
+            if "REDUCE_ONLY" in str(reason).upper():
+                cb = getattr(self, "on_reduce_only_reject", None)
+                if cb:
+                    try:
+                        cb(o.side, now)
+                    except Exception:
+                        log.exception("on_reduce_only_reject failed")
 
     async def reconcile(self, rows: list, now: float) -> None:
         m = self.get_market()

@@ -61,8 +61,11 @@ def main() -> None:
     if not cfg.dry_run and cfg.env_name == "mainnet":
         log.warning("LIVE ON MAINNET - real funds. Only post-only limit orders. Ctrl+C cancels all and exits.")
 
+    holder: list = []
+
     async def _main() -> None:
         bot = MarketMaker(cfg)
+        holder.append(bot)
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:
@@ -76,6 +79,12 @@ def main() -> None:
         asyncio.run(_main(), loop_factory=uvloop.new_event_loop)
     except ImportError:
         asyncio.run(_main())
+
+    if holder and getattr(holder[0], "restart_requested", False):
+        log.warning("Restarting process now (stall watchdog) ...")
+        import time as _t
+        _t.sleep(2)
+        os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
 if __name__ == "__main__":

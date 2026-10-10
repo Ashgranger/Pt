@@ -90,6 +90,11 @@ class Config:
     max_hold_s: float
 
     # --- adverse-selection guards ------------------------------------------ #
+    stall_restart_s: float
+    pos_resync_s: float
+    ws_stale_s: float
+    ws_ping_interval_s: float
+    ws_ping_timeout_s: float
     trend_window_s: float
     trend_pull_bps: Decimal
     trend_widen: Decimal
@@ -266,6 +271,11 @@ class Config:
             exit_min_profit_bps=_d("EXIT_MIN_PROFIT_BPS", "1.5"),
             stress_loss_bps=_d("STRESS_LOSS_BPS", "20"),
             max_hold_s=float(_e("MAX_HOLD_S", 120)),
+            stall_restart_s=float(_e("STALL_RESTART_S", 900)),
+            pos_resync_s=float(_e("POS_RESYNC_S", 30)),            # REST position check cadence (0 = off)
+            ws_stale_s=float(_e("WS_STALE_S", 25)),                # no frame at all for this long -> reconnect
+            ws_ping_interval_s=float(_e("WS_PING_INTERVAL_S", 10)),
+            ws_ping_timeout_s=float(_e("WS_PING_TIMEOUT_S", 15)),
             trend_window_s=float(_e("TREND_WINDOW_S", 5)),
             trend_pull_bps=_d("TREND_PULL_BPS", "2.5"),
             trend_widen=_d("TREND_WIDEN", "1"),
