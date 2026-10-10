@@ -832,13 +832,6 @@ class Ledger:
         avg_m = self._calc_weighted_markout(buf)
         return max(ZERO, -avg_m)
 
-    def force_position(self, new_pos: Decimal, now: float, mid: Decimal, min_notional: Decimal) -> None:
-        """Overwrite the local position (desync repair). Resets cost basis to mid so unwind logic starts clean."""
-        self.position = new_pos
-        self.avg_cost = mid
-        self._mismatch = 0
-        self.opened_ts = None if self.is_flat(mid, min_notional) else now
-
     def reconcile(self, ex_pos: Decimal, now: float, mid: Decimal, min_notional: Decimal) -> bool:
         tol = (min_notional / mid) * Decimal("0.25") if mid else Decimal("1e-8")
         if abs(ex_pos - self.position) <= tol:
@@ -856,3 +849,4 @@ class Ledger:
             self.avg_cost = mid
         self.opened_ts = None if self.is_flat(mid, min_notional) else now
         return True
+
